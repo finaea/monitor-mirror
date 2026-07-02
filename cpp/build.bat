@@ -2,5 +2,5 @@
 REM Build the mirror app with MinGW g++ (no Visual Studio needed).
 REM Produces mirror.exe as a GUI app (no console window), with a custom file icon.
 windres app.rc -O coff -o app.res
-g++ -std=c++17 -O2 -municode -mwindows mirror.cpp app.res -o mirror.exe -ld3d11 -ldxgi -ld3dcompiler -lgdi32 -ldwmapi -luuid -lole32
+g++ -std=c++17 -O2 -municode -mwindows mirror.cpp config_gui.cpp app.res -o mirror.exe -ld3d11 -ldxgi -ld3dcompiler -lgdi32 -ldwmapi -luuid -lole32 -lcomdlg32 -lwinmm -lcomctl32
 if %ERRORLEVEL%==0 (echo BUILD OK -^> mirror.exe) else (echo BUILD FAILED)

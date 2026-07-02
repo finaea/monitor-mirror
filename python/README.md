@@ -1,11 +1,16 @@
-# mirror (Python)
+# mirror (Python) — archival
+
+> **This is the older, archived version.** The maintained app is the C++ build in
+> [`../cpp`](../cpp), which is faster, smaller, and configured with a visual setup
+> window. Use that unless you specifically want the readable Python source.
 
 Low-latency 1:1 monitor mirror. Mirrors the **right 2560×1440 half** of a 32:9
 (5120×1440) source display onto a 2560×1440 target display, exact 1:1, vsync off,
-with the cursor composited in. Runs from the **system tray**.
+with the cursor composited in. Runs from the **system tray**. Settings are edited
+as constants in `mirror.py` (there is no setup window in this version).
 
-This is the easy-to-hack version. For the lowest-latency / smallest-exe build, see
-[`../cpp`](../cpp). Differences are summarized in the [top-level README](../README.md).
+A full side-by-side comparison of the two builds is in
+[`build_compare.md`](build_compare.md).
 
 ## Run from source
 

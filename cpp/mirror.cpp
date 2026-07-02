@@ -1,22 +1,27 @@
 // ===========================================================================
-// mirror.cpp - Ultra-low-latency 1:1 monitor mirror (Windows, D3D11 / DXGI)
+// mirror.cpp - Ultra-low-latency monitor mirror (Windows, D3D11 / DXGI)
 //
-//   SOURCE : 32:9, native 5120x1440 (DISPLAY1, primary)
-//   TARGET : 16:9, 2560x1440      (DISPLAY2)
-//   Mirrors the RIGHT 2560x1440 half of the source onto the target, 1:1.
+// Mirrors a user-chosen rectangle of a "working" monitor (where your drawing
+// software runs) onto a rectangle of a second "mirror" monitor. The mirror
+// rectangle is locked to the working rectangle's aspect ratio, so the picture
+// is never distorted - it is copied 1:1 when the sizes match, or cleanly scaled
+// when they differ.
+//
+// Everything is configured from a visual GUI (see config_gui.cpp), reached from
+// the tray "Edit..." menu or shown automatically on first launch / on any
+// error. The configuration is saved next to the exe (mirror.cfg) and can be
+// imported / exported.
 //
 // Architecture (all-GPU, no CPU round-trip):
-//   - DXGI Desktop Duplication gives the desktop as a GPU texture.
-//   - CopySubresourceRegion crops the right half into a GPU texture.
-//   - A flip-model swapchain presents it with tearing (vsync OFF), the
+//   - DXGI Desktop Duplication gives the working monitor as a GPU texture.
+//   - CopySubresourceRegion crops the working rectangle into a GPU texture.
+//   - A flip-model swapchain presents it with tearing (vsync off), the
 //     compositor (DWM) bypassed via independent flip -> minimal latency.
-//   - The cursor (which Duplication delivers separately) is composited as a
-//     GPU quad on top.
-//   - Runs from the system tray; left-click or the menu toggles mirroring.
+//   - The cursor (delivered separately by Duplication) is composited as a quad.
+//   - Runs from the system tray; left-click toggles mirroring.
 //
-// Build: see build.bat  (MinGW g++).   Quit: tray menu, or Esc when focused.
+// Build: see build.bat  (MinGW g++).
 // ===========================================================================
-
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -28,48 +33,45 @@
 #include <dxgi1_5.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
+#include <mmsystem.h>
 #include <vector>
 #include <string>
 #include <cstdio>
+#include <algorithm>
+
+#include "monitors.h"
+#include "config.h"
+#include "config_gui.h"
 
 using Microsoft::WRL::ComPtr;
-
-// ----------------------------------------------------------------------------
-// CONFIG
-// ----------------------------------------------------------------------------
-static int   SRC_W = 5120, SRC_H = 1440;   // native source resolution
-static int   TGT_W = 2560, TGT_H = 1440;   // target resolution
-static int   CROP_X = 0, CROP_Y = 0;       // set after detection (right half)
-static const bool VSYNC = false;           // false = tearing/lowest latency
-static const bool SHOW_CURSOR = true;
-// CROP_X defaults to (SRC_W - TGT_W) i.e. the right half (computed in main).
 
 // ----------------------------------------------------------------------------
 // Globals / tray
 // ----------------------------------------------------------------------------
 static const wchar_t* kClassName = L"MirrorD3D11Window";
-static const UINT WM_TRAY = WM_APP + 1;
+static const UINT WM_TRAY   = WM_APP + 1;
 static const UINT IDM_TOGGLE = 1001;
-static const UINT IDM_QUIT   = 1002;
+static const UINT IDM_EDIT   = 1002;
+static const UINT IDM_QUIT   = 1003;
 
+static HINSTANCE   g_hInst = nullptr;
 static HWND        g_hwnd = nullptr;
 static NOTIFYICONDATAW g_nid = {};
 static HICON       g_icon = nullptr;
-static bool        g_enabled = true;   // mirroring on/off
+static bool        g_enabled = true;
 static bool        g_running = true;
+static bool        g_reconfigure = false;   // rebuild pipeline (display change / edit-save)
+static bool        g_showConfig  = false;   // open the setup dialog next loop iteration
+
+static MirrorConfig            g_cfg;
+static std::vector<MonitorInfo> g_monitors;
+static std::wstring            g_cfgPath;
 
 // ----------------------------------------------------------------------------
-// Helpers
-// ----------------------------------------------------------------------------
-#define HRCHECK(expr, msg) do { HRESULT _hr=(expr); if(FAILED(_hr)){ \
-    wchar_t _b[256]; swprintf(_b,256,L"%S failed: 0x%08lX",msg,(unsigned long)_hr); \
-    MessageBoxW(nullptr,_b,L"mirror",MB_ICONERROR); return false; } } while(0)
-
-static void log(const char* fmt, ...) {
+static void logf(const char* fmt, ...) {
     char buf[512]; va_list ap; va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
     OutputDebugStringA(buf); OutputDebugStringA("\n");
-    printf("%s\n", buf); fflush(stdout);
 }
 
 // ----------------------------------------------------------------------------
@@ -81,142 +83,121 @@ struct Mirror {
     ComPtr<IDXGIAdapter1>       srcAdapter;
     ComPtr<IDXGIOutput1>        srcOutput;
     ComPtr<IDXGIOutputDuplication> dupl;
-    DXGI_OUTPUT_DESC            srcDesc = {};
 
     ComPtr<IDXGISwapChain2>     swap;
     HANDLE                      waitable = nullptr;
     bool                        allowTearing = false;
     ComPtr<ID3D11RenderTargetView> rtv;
-    ComPtr<ID3D11Texture2D>     cropTex;      // SRV-able copy of the crop region
+    ComPtr<ID3D11Texture2D>     cropTex;
     ComPtr<ID3D11ShaderResourceView> cropSRV;
 
-    // shader pipeline
     ComPtr<ID3D11VertexShader>  vs;
     ComPtr<ID3D11PixelShader>   ps;
     ComPtr<ID3D11Buffer>        cb;
-    ComPtr<ID3D11SamplerState>  samp;
+    ComPtr<ID3D11SamplerState>  sampPoint, sampLinear;
     ComPtr<ID3D11BlendState>    blendOpaque, blendAlpha;
+    ComPtr<ID3D11RasterizerState> rsScissor;
 
     // cursor
     ComPtr<ID3D11Texture2D>     curTex;
     ComPtr<ID3D11ShaderResourceView> curSRV;
-    int  curW = 0, curH = 0;
-    int  curX = 0, curY = 0;
+    int  curW = 0, curH = 0, curX = 0, curY = 0;
     bool curVisible = false;
 
-    bool init();
+    // geometry (derived from config), all in physical pixels
+    int cropX=0, cropY=0, cropW=0, cropH=0;   // region on the working monitor
+    int winW=0, winH=0;                        // window == full mirror monitor
+    int drawX=0, drawY=0, drawW=0, drawH=0;    // where the mirror is drawn in the window
+    bool vsync=false, showCursor=true;
+    bool scaling=false;
+
+    bool init(const MirrorConfig& cfg, const std::vector<MonitorInfo>& mons, HWND hwnd, std::wstring& err);
     bool createDuplication();
     bool createPipeline();
-    void renderFrame();   // acquire -> crop -> draw -> present (one iteration)
+    void renderFrame();
     void updateCursor(IDXGIOutputDuplication* d, const DXGI_OUTDUPL_FRAME_INFO& fi);
     void buildCursorTexture(const std::vector<BYTE>& bgra, int w, int h);
 };
 
 struct CB { float posRect[4]; float uvRect[4]; };
 
-// Embedded HLSL: one quad generator + one textured pixel shader.
 static const char* kVS =
 "cbuffer CB:register(b0){float4 posRect;float4 uvRect;};"
 "struct VO{float4 pos:SV_Position;float2 uv:TEXCOORD;};"
 "VO main(uint vid:SV_VertexID){"
-" float2 g=float2((vid&1),(vid>>1));"          // 0:(0,0) 1:(1,0) 2:(0,1) 3:(1,1)
+" float2 g=float2((vid&1),(vid>>1));"
 " VO o;"
 " o.pos=float4(lerp(posRect.x,posRect.z,g.x),lerp(posRect.y,posRect.w,g.y),0,1);"
 " o.uv =float2(lerp(uvRect.x,uvRect.z,g.x),lerp(uvRect.y,uvRect.w,g.y));"
 " return o;}";
-
 static const char* kPS =
 "Texture2D tex:register(t0);SamplerState smp:register(s0);"
 "struct VO{float4 pos:SV_Position;float2 uv:TEXCOORD;};"
 "float4 main(VO i):SV_Target{return tex.Sample(smp,i.uv);}";
 
 // ----------------------------------------------------------------------------
-// Detection: find the source output (== SRC_W x SRC_H, else widest) and the
-// target monitor (== TGT_W x TGT_H, not the source). Returns target rect.
+// Build all geometry + D3D resources from the config. Returns false + reason.
 // ----------------------------------------------------------------------------
-static bool detectDisplays(Mirror& m, RECT& targetRect) {
-    ComPtr<IDXGIFactory1> factory;
-    HRCHECK(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)factory.GetAddressOf()),
-            "CreateDXGIFactory1");
+bool Mirror::init(const MirrorConfig& cfg, const std::vector<MonitorInfo>& mons, HWND hwnd, std::wstring& err) {
+    int si = FindMonitor(mons, cfg.source.device);
+    int ti = FindMonitor(mons, cfg.target.device);
+    if (si < 0 || ti < 0) { err = L"A configured monitor is not connected."; return false; }
 
-    struct Found { ComPtr<IDXGIAdapter1> ad; ComPtr<IDXGIOutput1> out; DXGI_OUTPUT_DESC desc; };
-    std::vector<Found> outs;
+    // ---- find the DXGI output matching the working monitor's device name ----
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)factory.GetAddressOf()))) {
+        err = L"Direct3D initialization failed (CreateDXGIFactory1)."; return false; }
     ComPtr<IDXGIAdapter1> ad;
-    for (UINT ai = 0; factory->EnumAdapters1(ai, ad.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; ++ai) {
+    bool found = false;
+    for (UINT ai = 0; !found && factory->EnumAdapters1(ai, ad.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; ++ai) {
         ComPtr<IDXGIOutput> o;
         for (UINT oi = 0; ad->EnumOutputs(oi, o.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; ++oi) {
             DXGI_OUTPUT_DESC d; o->GetDesc(&d);
             if (!d.AttachedToDesktop) continue;
-            ComPtr<IDXGIOutput1> o1; o.As(&o1);
-            outs.push_back({ad, o1, d});
+            if (cfg.source.device == d.DeviceName) {
+                srcAdapter = ad; o.As(&srcOutput); found = true; break;
+            }
         }
     }
-    if (outs.empty()) { MessageBoxW(nullptr, L"No outputs found", L"mirror", MB_ICONERROR); return false; }
+    if (!found || !srcOutput) { err = L"Could not open the working monitor for capture."; return false; }
 
-    auto wOf = [](const DXGI_OUTPUT_DESC& d){ return d.DesktopCoordinates.right - d.DesktopCoordinates.left; };
-    auto hOf = [](const DXGI_OUTPUT_DESC& d){ return d.DesktopCoordinates.bottom - d.DesktopCoordinates.top; };
-
-    // source: exact match, else widest
-    int srcIdx = -1;
-    for (size_t i = 0; i < outs.size(); ++i)
-        if (wOf(outs[i].desc) == SRC_W && hOf(outs[i].desc) == SRC_H) { srcIdx = (int)i; break; }
-    if (srcIdx < 0) {
-        int best = -1, bw = -1;
-        for (size_t i = 0; i < outs.size(); ++i) if (wOf(outs[i].desc) > bw) { bw = wOf(outs[i].desc); best = (int)i; }
-        srcIdx = best;
-        SRC_W = wOf(outs[srcIdx].desc); SRC_H = hOf(outs[srcIdx].desc);
-        log("source exact match not found; using widest output %dx%d", SRC_W, SRC_H);
+    // ---- geometry ----
+    // cover=true : the window fills the whole mirror monitor, mirror drawn as a
+    //              sub-rectangle with black margins around it.
+    // cover=false: the window is exactly the mirror rectangle, so the rest of the
+    //              monitor (desktop / other apps) stays visible.
+    cropX = cfg.source.x; cropY = cfg.source.y; cropW = cfg.source.w; cropH = cfg.source.h;
+    drawW = cfg.target.w; drawH = cfg.target.h;
+    if (cfg.cover) {
+        winW = mons[ti].w(); winH = mons[ti].h();
+        drawX = cfg.target.x; drawY = cfg.target.y;
+    } else {
+        winW = cfg.target.w; winH = cfg.target.h;
+        drawX = 0; drawY = 0;
     }
-    m.srcAdapter = outs[srcIdx].ad;
-    m.srcOutput  = outs[srcIdx].out;
-    m.srcDesc    = outs[srcIdx].desc;
+    vsync = cfg.vsync;     showCursor = cfg.cursor;
+    scaling = (cropW != drawW) || (cropH != drawH);
+    logf("crop=(%d,%d %dx%d)  win=%dx%d  draw=(%d,%d %dx%d)  scaling=%d",
+         cropX, cropY, cropW, cropH, winW, winH, drawX, drawY, drawW, drawH, scaling);
 
-    // target: TGT_W x TGT_H, not the source; else any other output
-    int tgtIdx = -1;
-    for (size_t i = 0; i < outs.size(); ++i)
-        if ((int)i != srcIdx && wOf(outs[i].desc) == TGT_W && hOf(outs[i].desc) == TGT_H) { tgtIdx = (int)i; break; }
-    if (tgtIdx < 0)
-        for (size_t i = 0; i < outs.size(); ++i) if ((int)i != srcIdx) { tgtIdx = (int)i; break; }
-    if (tgtIdx < 0) { MessageBoxW(nullptr, L"No second monitor for the mirror window", L"mirror", MB_ICONERROR); return false; }
-
-    targetRect = outs[tgtIdx].desc.DesktopCoordinates;
-    TGT_W = targetRect.right - targetRect.left;
-    TGT_H = targetRect.bottom - targetRect.top;
-
-    if (CROP_X == 0 && CROP_Y == 0) CROP_X = SRC_W - TGT_W;   // default: right half
-    if (CROP_X + TGT_W > SRC_W) CROP_X = SRC_W - TGT_W;
-    if (CROP_Y + TGT_H > SRC_H) CROP_Y = SRC_H - TGT_H;
-
-    log("source %dx%d  target %dx%d @(%ld,%ld)  crop=(%d,%d)",
-        SRC_W, SRC_H, TGT_W, TGT_H, (long)targetRect.left, (long)targetRect.top, CROP_X, CROP_Y);
-    return true;
-}
-
-// ----------------------------------------------------------------------------
-bool Mirror::init() {
+    // ---- device on the source adapter ----
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     D3D_FEATURE_LEVEL fl;
-    // device MUST be on the source adapter (same GPU drives both monitors here)
-    HRCHECK(D3D11CreateDevice(srcAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
-            nullptr, 0, D3D11_SDK_VERSION, dev.GetAddressOf(), &fl, ctx.GetAddressOf()),
-            "D3D11CreateDevice");
-    if (!createDuplication()) return false;
-    if (!createPipeline())    return false;
+    if (FAILED(D3D11CreateDevice(srcAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
+            nullptr, 0, D3D11_SDK_VERSION, dev.GetAddressOf(), &fl, ctx.GetAddressOf()))) {
+        err = L"Direct3D device creation failed."; return false; }
+
+    if (!createDuplication()) { err = L"Screen capture (Desktop Duplication) could not start on the working monitor."; return false; }
+    if (!createPipeline())    { err = L"The graphics pipeline could not be created."; return false; }
     return true;
 }
 
 bool Mirror::createDuplication() {
     dupl.Reset();
-    HRESULT hr = srcOutput->DuplicateOutput(dev.Get(), dupl.GetAddressOf());
-    if (FAILED(hr)) {
-        wchar_t b[256]; swprintf(b, 256, L"DuplicateOutput failed: 0x%08lX", (unsigned long)hr);
-        MessageBoxW(nullptr, b, L"mirror", MB_ICONERROR); return false;
-    }
-    return true;
+    return SUCCEEDED(srcOutput->DuplicateOutput(dev.Get(), dupl.GetAddressOf()));
 }
 
 bool Mirror::createPipeline() {
-    // ---- swapchain (flip model, tearing, waitable) ----
     ComPtr<IDXGIFactory2> f2;
     ComPtr<IDXGIDevice>   dxgiDev; dev.As(&dxgiDev);
     ComPtr<IDXGIAdapter>  ad;      dxgiDev->GetAdapter(ad.GetAddressOf());
@@ -228,7 +209,7 @@ bool Mirror::createPipeline() {
     allowTearing = (tearing == TRUE);
 
     DXGI_SWAP_CHAIN_DESC1 sc = {};
-    sc.Width = TGT_W; sc.Height = TGT_H;
+    sc.Width = winW; sc.Height = winH;
     sc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     sc.SampleDesc.Count = 1;
     sc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -240,59 +221,60 @@ bool Mirror::createPipeline() {
     if (allowTearing) sc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
 
     ComPtr<IDXGISwapChain1> sc1;
-    HRCHECK(f2->CreateSwapChainForHwnd(dev.Get(), g_hwnd, &sc, nullptr, nullptr, sc1.GetAddressOf()),
-            "CreateSwapChainForHwnd");
+    if (FAILED(f2->CreateSwapChainForHwnd(dev.Get(), g_hwnd, &sc, nullptr, nullptr, sc1.GetAddressOf())))
+        return false;
     f2->MakeWindowAssociation(g_hwnd, DXGI_MWA_NO_ALT_ENTER);
-    HRCHECK(sc1.As(&swap), "QI IDXGISwapChain2");
+    if (FAILED(sc1.As(&swap))) return false;
     swap->SetMaximumFrameLatency(1);
     waitable = swap->GetFrameLatencyWaitableObject();
 
-    // ---- backbuffer RTV (flip model: buffer 0 is always current) ----
     ComPtr<ID3D11Texture2D> bb;
-    HRCHECK(swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)bb.GetAddressOf()), "GetBuffer");
-    HRCHECK(dev->CreateRenderTargetView(bb.Get(), nullptr, rtv.GetAddressOf()), "CreateRTV");
+    if (FAILED(swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)bb.GetAddressOf()))) return false;
+    if (FAILED(dev->CreateRenderTargetView(bb.Get(), nullptr, rtv.GetAddressOf()))) return false;
 
-    // ---- SRV-able crop texture (copy target from the duplicated frame) ----
     D3D11_TEXTURE2D_DESC td = {};
-    td.Width = TGT_W; td.Height = TGT_H; td.MipLevels = 1; td.ArraySize = 1;
+    td.Width = cropW; td.Height = cropH; td.MipLevels = 1; td.ArraySize = 1;
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    HRCHECK(dev->CreateTexture2D(&td, nullptr, cropTex.GetAddressOf()), "CreateCropTex");
-    HRCHECK(dev->CreateShaderResourceView(cropTex.Get(), nullptr, cropSRV.GetAddressOf()), "CropSRV");
+    if (FAILED(dev->CreateTexture2D(&td, nullptr, cropTex.GetAddressOf()))) return false;
+    if (FAILED(dev->CreateShaderResourceView(cropTex.Get(), nullptr, cropSRV.GetAddressOf()))) return false;
 
-    // ---- shaders ----
-    ComPtr<ID3DBlob> vsb, psb, err;
-    if (FAILED(D3DCompile(kVS, strlen(kVS), nullptr, nullptr, nullptr, "main", "vs_4_0", 0, 0, vsb.GetAddressOf(), err.GetAddressOf()))) {
-        MessageBoxA(nullptr, err ? (char*)err->GetBufferPointer() : "VS compile failed", "mirror", MB_ICONERROR); return false; }
-    err.Reset();
-    if (FAILED(D3DCompile(kPS, strlen(kPS), nullptr, nullptr, nullptr, "main", "ps_4_0", 0, 0, psb.GetAddressOf(), err.GetAddressOf()))) {
-        MessageBoxA(nullptr, err ? (char*)err->GetBufferPointer() : "PS compile failed", "mirror", MB_ICONERROR); return false; }
-    HRCHECK(dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, vs.GetAddressOf()), "CreateVS");
-    HRCHECK(dev->CreatePixelShader (psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, ps.GetAddressOf()), "CreatePS");
+    ComPtr<ID3DBlob> vsb, psb, e;
+    if (FAILED(D3DCompile(kVS, strlen(kVS), nullptr, nullptr, nullptr, "main", "vs_4_0", 0, 0, vsb.GetAddressOf(), e.GetAddressOf()))) return false;
+    e.Reset();
+    if (FAILED(D3DCompile(kPS, strlen(kPS), nullptr, nullptr, nullptr, "main", "ps_4_0", 0, 0, psb.GetAddressOf(), e.GetAddressOf()))) return false;
+    if (FAILED(dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, vs.GetAddressOf()))) return false;
+    if (FAILED(dev->CreatePixelShader (psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, ps.GetAddressOf()))) return false;
 
-    // ---- constant buffer ----
     D3D11_BUFFER_DESC bd = {}; bd.ByteWidth = sizeof(CB);
     bd.Usage = D3D11_USAGE_DYNAMIC; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    HRCHECK(dev->CreateBuffer(&bd, nullptr, cb.GetAddressOf()), "CreateCB");
+    if (FAILED(dev->CreateBuffer(&bd, nullptr, cb.GetAddressOf()))) return false;
 
-    // ---- sampler (point = exact 1:1, no blur) ----
     D3D11_SAMPLER_DESC sd = {};
-    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    HRCHECK(dev->CreateSamplerState(&sd, samp.GetAddressOf()), "CreateSampler");
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    if (FAILED(dev->CreateSamplerState(&sd, sampPoint.GetAddressOf()))) return false;
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    if (FAILED(dev->CreateSamplerState(&sd, sampLinear.GetAddressOf()))) return false;
 
-    // ---- blend states ----
     D3D11_BLEND_DESC bo = {};
     bo.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    HRCHECK(dev->CreateBlendState(&bo, blendOpaque.GetAddressOf()), "BlendOpaque");
+    if (FAILED(dev->CreateBlendState(&bo, blendOpaque.GetAddressOf()))) return false;
     D3D11_BLEND_DESC ba = {};
     auto& rt = ba.RenderTarget[0];
     rt.BlendEnable = TRUE;
     rt.SrcBlend = D3D11_BLEND_SRC_ALPHA;  rt.DestBlend = D3D11_BLEND_INV_SRC_ALPHA; rt.BlendOp = D3D11_BLEND_OP_ADD;
     rt.SrcBlendAlpha = D3D11_BLEND_ONE;   rt.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA; rt.BlendOpAlpha = D3D11_BLEND_OP_ADD;
     rt.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    HRCHECK(dev->CreateBlendState(&ba, blendAlpha.GetAddressOf()), "BlendAlpha");
+    if (FAILED(dev->CreateBlendState(&ba, blendAlpha.GetAddressOf()))) return false;
+
+    // rasterizer with scissor enabled so the (scaled) mirror + cursor stay
+    // clipped to the draw rectangle, leaving the rest of the monitor black.
+    D3D11_RASTERIZER_DESC rd = {};
+    rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE;
+    rd.ScissorEnable = TRUE; rd.DepthClipEnable = TRUE;
+    if (FAILED(dev->CreateRasterizerState(&rd, rsScissor.GetAddressOf()))) return false;
 
     return true;
 }
@@ -327,12 +309,8 @@ void Mirror::updateCursor(IDXGIOutputDuplication* d, const DXGI_OUTDUPL_FRAME_IN
     if (si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR) {
         out.resize(w * h * 4);
         for (int y = 0; y < h; ++y)
-            memcpy(&out[y * w * 4], &buf[y * si.Pitch], w * 4);            // BGRA straight
+            memcpy(&out[y * w * 4], &buf[y * si.Pitch], w * 4);
     } else if (si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR) {
-        // Mask byte semantics are INVERTED vs normal alpha:
-        //   mask==0    -> opaque, copy RGB
-        //   mask==0xFF -> XOR with screen. Black (RGB==0) XOR == no-op == transparent.
-        //                 Non-black XOR is a true inversion (rare); approximate as opaque.
         out.resize(w * h * 4);
         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
             int s = y * si.Pitch + x * 4, o = (y * w + x) * 4;
@@ -341,14 +319,13 @@ void Mirror::updateCursor(IDXGIOutputDuplication* d, const DXGI_OUTDUPL_FRAME_IN
             else if (r | g | b)       { out[o]=b; out[o+1]=g; out[o+2]=r; out[o+3]=255; }
             else                      { out[o]=0; out[o+1]=0; out[o+2]=0; out[o+3]=0; }
         }
-    } else { // MONOCHROME: top half AND mask, bottom half XOR mask, 1bpp
+    } else { // MONOCHROME
         h = si.Height / 2;
         out.resize(w * h * 4);
         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
             int bit = 7 - (x % 8);
             int andB = (buf[y * si.Pitch + (x / 8)] >> bit) & 1;
             int xorB = (buf[(h + y) * si.Pitch + (x / 8)] >> bit) & 1;
-            // and==0 -> opaque black/white; and==1 -> transparent (invert approximated as transparent)
             BYTE v = (andB == 0) ? (xorB ? 255 : 0) : 0;
             BYTE a = (andB == 0) ? 255 : 0;
             int o = (y*w + x)*4; out[o+0]=v; out[o+1]=v; out[o+2]=v; out[o+3]=a;
@@ -361,30 +338,48 @@ void Mirror::renderFrame() {
     ComPtr<IDXGIResource> res;
     DXGI_OUTDUPL_FRAME_INFO fi = {};
     HRESULT hr = dupl->AcquireNextFrame(15, &fi, res.GetAddressOf());
-    if (hr == DXGI_ERROR_WAIT_TIMEOUT) return;          // no new frame; keep last on screen
-    if (hr == DXGI_ERROR_ACCESS_LOST) { createDuplication(); return; }
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT) return;
+    if (hr == DXGI_ERROR_ACCESS_LOST) {
+        if (!createDuplication()) { g_reconfigure = true; }   // monitor likely gone
+        return;
+    }
     if (FAILED(hr)) return;
 
     ComPtr<ID3D11Texture2D> frameTex; res.As(&frameTex);
-    // crop the right-half region straight into our SRV texture (GPU->GPU)
-    D3D11_BOX box = { (UINT)CROP_X, (UINT)CROP_Y, 0, (UINT)(CROP_X+TGT_W), (UINT)(CROP_Y+TGT_H), 1 };
-    if (frameTex) ctx->CopySubresourceRegion(cropTex.Get(), 0, 0, 0, 0, frameTex.Get(), 0, &box);
+    // clamp crop box to the actual frame in case the resolution changed under us
+    D3D11_TEXTURE2D_DESC fd = {}; if (frameTex) frameTex->GetDesc(&fd);
+    if (frameTex && (int)fd.Width >= cropX + cropW && (int)fd.Height >= cropY + cropH) {
+        D3D11_BOX box = { (UINT)cropX, (UINT)cropY, 0, (UINT)(cropX+cropW), (UINT)(cropY+cropH), 1 };
+        ctx->CopySubresourceRegion(cropTex.Get(), 0, 0, 0, 0, frameTex.Get(), 0, &box);
+    }
 
-    if (SHOW_CURSOR) updateCursor(dupl.Get(), fi);
+    if (showCursor) updateCursor(dupl.Get(), fi);
     dupl->ReleaseFrame();
 
-    // ---- render: base blit + optional cursor quad ----
+    // ---- render ----
+    float black[4] = {0,0,0,1};
     ctx->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
-    D3D11_VIEWPORT vp = { 0, 0, (float)TGT_W, (float)TGT_H, 0, 1 };
+    ctx->ClearRenderTargetView(rtv.Get(), black);   // letterbox / margins stay black
+
+    D3D11_VIEWPORT vp = { 0, 0, (float)winW, (float)winH, 0, 1 };
     ctx->RSSetViewports(1, &vp);
+    D3D11_RECT scissor = { drawX, drawY, drawX + drawW, drawY + drawH };
+    ctx->RSSetScissorRects(1, &scissor);
+    ctx->RSSetState(rsScissor.Get());
     ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     ctx->IASetInputLayout(nullptr);
     ctx->VSSetShader(vs.Get(), nullptr, 0);
     ctx->PSSetShader(ps.Get(), nullptr, 0);
-    ctx->PSSetSamplers(0, 1, samp.GetAddressOf());
+    ID3D11SamplerState* smp = (scaling ? sampLinear : sampPoint).Get();
+    ctx->PSSetSamplers(0, 1, &smp);
     float bf[4] = {0,0,0,0};
 
-    auto drawQuad = [&](float x0,float y0,float x1,float y1, ID3D11ShaderResourceView* srv, ID3D11BlendState* bs){
+    // window-pixel rect -> NDC
+    auto pxQuad = [&](float x, float y, float w, float h, ID3D11ShaderResourceView* srv, ID3D11BlendState* bs){
+        float x0 =  (x        / winW) * 2.f - 1.f;
+        float x1 = ((x + w)   / winW) * 2.f - 1.f;
+        float y0 = 1.f - (y        / winH) * 2.f;
+        float y1 = 1.f - ((y + h)  / winH) * 2.f;
         D3D11_MAPPED_SUBRESOURCE ms; ctx->Map(cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
         CB c = { {x0,y0,x1,y1}, {0,0,1,1} }; memcpy(ms.pData, &c, sizeof(c)); ctx->Unmap(cb.Get(), 0);
         ctx->VSSetConstantBuffers(0, 1, cb.GetAddressOf());
@@ -393,34 +388,30 @@ void Mirror::renderFrame() {
         ctx->Draw(4, 0);
     };
 
-    // base: fullscreen (NDC: x -1..1, y +1..-1), uv 0..1
-    drawQuad(-1.f, 1.f, 1.f, -1.f, cropSRV.Get(), blendOpaque.Get());
+    // base: the mirrored region, scaled into the draw rectangle
+    pxQuad((float)drawX, (float)drawY, (float)drawW, (float)drawH, cropSRV.Get(), blendOpaque.Get());
 
-    // cursor: map source-pixel position into the window, draw at native size
-    if (SHOW_CURSOR && curVisible && curSRV && curW > 0) {
-        float cx = (float)(curX - CROP_X), cy = (float)(curY - CROP_Y);
-        if (cx + curW > 0 && cy + curH > 0 && cx < TGT_W && cy < TGT_H) {
-            float x0 =  (cx / TGT_W) * 2.f - 1.f;
-            float x1 = ((cx + curW) / TGT_W) * 2.f - 1.f;
-            float y0 = 1.f - (cy / TGT_H) * 2.f;
-            float y1 = 1.f - ((cy + curH) / TGT_H) * 2.f;
-            drawQuad(x0, y0, x1, y1, curSRV.Get(), blendAlpha.Get());
-        }
+    // cursor: map from source pixels into the draw rectangle (same scale)
+    if (showCursor && curVisible && curSRV && curW > 0 && cropW > 0 && cropH > 0) {
+        float sx = (float)drawW / cropW, sy = (float)drawH / cropH;
+        float rx = (curX - cropX) * sx + drawX;
+        float ry = (curY - cropY) * sy + drawY;
+        float rw = curW * sx, rh = curH * sy;
+        if (rx + rw > drawX && ry + rh > drawY && rx < drawX + drawW && ry < drawY + drawH)
+            pxQuad(rx, ry, rw, rh, curSRV.Get(), blendAlpha.Get());
     }
 
-    UINT flags = (!VSYNC && allowTearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
-    swap->Present(VSYNC ? 1 : 0, flags);
+    UINT flags = (!vsync && allowTearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    swap->Present(vsync ? 1 : 0, flags);
 }
 
 // ----------------------------------------------------------------------------
 // Tray
 // ----------------------------------------------------------------------------
-// Generate a 32x32 ARGB tray icon at runtime: an ultrawide screen with its
-// right half lit (the mirrored region). No external .ico file needed.
 static HICON makeTrayIcon(bool on) {
     const int S = 32;
     BITMAPV5HEADER bi = {};
-    bi.bV5Size = sizeof(bi); bi.bV5Width = S; bi.bV5Height = -S;  // top-down
+    bi.bV5Size = sizeof(bi); bi.bV5Width = S; bi.bV5Height = -S;
     bi.bV5Planes = 1; bi.bV5BitCount = 32; bi.bV5Compression = BI_BITFIELDS;
     bi.bV5RedMask = 0x00FF0000; bi.bV5GreenMask = 0x0000FF00;
     bi.bV5BlueMask = 0x000000FF; bi.bV5AlphaMask = 0xFF000000;
@@ -431,20 +422,20 @@ static HICON makeTrayIcon(bool on) {
     DWORD* px = (DWORD*)bits;
 
     const DWORD CLEAR = 0x00000000;
-    const DWORD FRAME = 0xFF202833;                  // dark bezel
-    const DWORD DIM   = on ? 0xFF14323A : 0xFF2A2A2A; // left half (source)
-    const DWORD LIT   = on ? 0xFF35D6F0 : 0xFF555555; // right half (mirrored)
+    const DWORD FRAME = 0xFF202833;
+    const DWORD DIM   = on ? 0xFF14323A : 0xFF2A2A2A;
+    const DWORD LIT   = on ? 0xFF35D6F0 : 0xFF555555;
     for (int y = 0; y < S; ++y) for (int x = 0; x < S; ++x) {
         DWORD c = CLEAR;
-        bool frame = (x >= 2 && x <= 29 && y >= 8 && y <= 23);     // wide 32:9-ish screen
+        bool frame = (x >= 2 && x <= 29 && y >= 8 && y <= 23);
         bool inner = (x >= 4 && x <= 27 && y >= 10 && y <= 21);
-        bool stand = (x >= 14 && x <= 17 && y >= 24 && y <= 26);   // little stand
+        bool stand = (x >= 14 && x <= 17 && y >= 24 && y <= 26);
         if (frame) c = FRAME;
-        if (inner) c = (x >= 16) ? LIT : DIM;                      // right half lit
+        if (inner) c = (x >= 16) ? LIT : DIM;
         if (stand) c = FRAME;
         px[y * S + x] = c;
     }
-    std::vector<BYTE> zero((S * S) / 8, 0);          // all-zero AND mask (alpha governs)
+    std::vector<BYTE> zero((S * S) / 8, 0);
     HBITMAP mask = CreateBitmap(S, S, 1, 1, zero.data());
     ICONINFO ii = {}; ii.fIcon = TRUE; ii.hbmColor = color; ii.hbmMask = mask;
     HICON ic = CreateIconIndirect(&ii);
@@ -467,28 +458,27 @@ static void removeTray() {
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
     if (g_icon) { DestroyIcon(g_icon); g_icon = nullptr; }
 }
-
 static void setEnabled(bool on) {
     g_enabled = on;
     ShowWindow(g_hwnd, on ? SW_SHOWNA : SW_HIDE);
     HICON old = g_icon;
-    g_icon = makeTrayIcon(on);                  // lit when ON, greyed when OFF
+    g_icon = makeTrayIcon(on);
     g_nid.uFlags = NIF_ICON | NIF_TIP;
     g_nid.hIcon = g_icon;
     wcscpy(g_nid.szTip, on ? L"Mirror: ON (left-click to disable)"
                           : L"Mirror: OFF (left-click to enable)");
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
-    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;   // restore for future adds
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     if (old) DestroyIcon(old);
 }
-
 static void showMenu(HWND hwnd) {
     POINT p; GetCursorPos(&p);
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING | (g_enabled ? MF_CHECKED : 0), IDM_TOGGLE, L"Enabled");
+    AppendMenuW(menu, MF_STRING, IDM_EDIT, L"Edit setup...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_QUIT, L"Quit");
-    SetForegroundWindow(hwnd);                          // so the menu dismisses correctly
+    SetForegroundWindow(hwnd);
     TrackPopupMenu(menu, TPM_RIGHTBUTTON, p.x, p.y, 0, hwnd, nullptr);
     DestroyMenu(menu);
 }
@@ -500,11 +490,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (LOWORD(lp) == WM_RBUTTONUP) showMenu(hwnd);
         return 0;
     case WM_COMMAND:
-        if (LOWORD(wp) == IDM_TOGGLE) setEnabled(!g_enabled);
+        if (LOWORD(wp) == IDM_TOGGLE)      setEnabled(!g_enabled);
+        else if (LOWORD(wp) == IDM_EDIT)   g_showConfig = true;
         else if (LOWORD(wp) == IDM_QUIT) { g_running = false; PostQuitMessage(0); }
         return 0;
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) { g_running = false; PostQuitMessage(0); }
+        return 0;
+    case WM_DISPLAYCHANGE:
+        g_reconfigure = true;   // resolution / monitor topology changed
         return 0;
     case WM_DESTROY:
         g_running = false; PostQuitMessage(0); return 0;
@@ -513,31 +507,88 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // ----------------------------------------------------------------------------
+// Setup / fallback: make sure g_cfg is valid and the Mirror is built.
+// Repeatedly shows the setup dialog until the user succeeds or chooses Quit.
+// Returns false if the user chose Cancel & Quit.
+// ----------------------------------------------------------------------------
+static bool ensureConfigured(Mirror& m, std::wstring banner) {
+    for (;;) {
+        g_monitors = EnumMonitors();
+        std::wstring err = ValidateConfig(g_cfg, g_monitors);
+        if (err.empty()) {
+            // position the window (whole monitor when covering, else just the
+            // mirror rectangle), then build
+            int ti = FindMonitor(g_monitors, g_cfg.target.device);
+            const MonitorInfo& tm = g_monitors[ti];
+            int wx, wy, ww, wh;
+            if (g_cfg.cover) {
+                wx = tm.rect.left; wy = tm.rect.top; ww = tm.w(); wh = tm.h();
+            } else {
+                wx = tm.rect.left + g_cfg.target.x; wy = tm.rect.top + g_cfg.target.y;
+                ww = g_cfg.target.w; wh = g_cfg.target.h;
+            }
+            SetWindowPos(g_hwnd, HWND_TOPMOST, wx, wy, ww, wh, SWP_NOACTIVATE);
+            m = Mirror();
+            std::wstring berr;
+            if (m.init(g_cfg, g_monitors, g_hwnd, berr)) {
+                if (g_enabled) ShowWindow(g_hwnd, SW_SHOWNA);
+                return true;
+            }
+            err = berr;
+        }
+        std::wstring b = !banner.empty() ? banner : err;
+        if (RunConfigDialog(g_cfg, g_monitors, g_hInst, b, g_cfgPath) == ConfigResult::Quit)
+            return false;
+        banner.clear();   // subsequent rounds show the real validation error
+    }
+}
+
+// ----------------------------------------------------------------------------
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
-    // Per-Monitor-V2 DPI awareness -> DXGI/coords are physical pixels (1:1).
+    g_hInst = hInst;
     typedef BOOL (WINAPI* SetCtx)(HANDLE);
     if (auto p = (SetCtx)GetProcAddress(GetModuleHandleW(L"user32"), "SetProcessDpiAwarenessContext"))
         p((HANDLE)-4 /* PER_MONITOR_AWARE_V2 */);
+    timeBeginPeriod(1);   // finer Sleep granularity for the FPS cap
 
-    Mirror m;
-    RECT tr;
-    if (!detectDisplays(m, tr)) return 1;
+    g_cfgPath = DefaultConfigPath();
+    g_monitors = EnumMonitors();
 
+    // ---- first launch / load: prompt to set up or import if missing/invalid ----
+    bool loaded = LoadConfig(g_cfg, g_cfgPath);
+    std::wstring initialBanner;
+    bool needPrompt = false;
+    if (!loaded) {
+        initialBanner = L"No configuration found.  Set up your working area below, or click Import... to load one.  "
+                        L"The app won't start until it's configured.";
+        needPrompt = true;
+    } else {
+        std::wstring err = ValidateConfig(g_cfg, g_monitors);
+        if (!err.empty()) { initialBanner = err + L"   Please re-setup or Import a configuration."; needPrompt = true; }
+    }
+    if (needPrompt) {
+        if (RunConfigDialog(g_cfg, g_monitors, hInst, initialBanner, g_cfgPath) == ConfigResult::Quit) {
+            timeEndPeriod(1);
+            return 0;   // user chose Cancel & Quit
+        }
+    }
+
+    // ---- window (covers the mirror monitor; repositioned in ensureConfigured) ----
     WNDCLASSW wc = {};
     wc.lpfnWndProc = WndProc; wc.hInstance = hInst; wc.lpszClassName = kClassName;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
-
-    // borderless window covering the target monitor
     g_hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP, kClassName, L"mirror",
-        WS_POPUP, tr.left, tr.top, TGT_W, TGT_H, nullptr, nullptr, hInst, nullptr);
-    if (!g_hwnd) { MessageBoxW(nullptr, L"CreateWindow failed", L"mirror", MB_ICONERROR); return 1; }
+        WS_POPUP, 0, 0, 640, 480, nullptr, nullptr, hInst, nullptr);
+    if (!g_hwnd) { MessageBoxW(nullptr, L"CreateWindow failed", L"mirror", MB_ICONERROR); timeEndPeriod(1); return 1; }
 
-    if (!m.init()) return 1;
+    Mirror m;
+    if (!ensureConfigured(m, L"")) { timeEndPeriod(1); return 0; }
     addTray(g_hwnd);
-    ShowWindow(g_hwnd, SW_SHOWNA);
 
-    // Single-threaded loop: pump messages, then render a frame when enabled.
+    LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER last = {}; QueryPerformanceCounter(&last);
+
     MSG msg;
     while (g_running) {
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -545,14 +596,41 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
             TranslateMessage(&msg); DispatchMessageW(&msg);
         }
         if (!g_running) break;
+
+        // tray "Edit setup..." -> open the dialog live
+        if (g_showConfig) {
+            g_showConfig = false;
+            MirrorConfig edited = g_cfg;
+            if (RunConfigDialog(edited, g_monitors, hInst, L"", g_cfgPath) == ConfigResult::Save) {
+                g_cfg = edited; g_reconfigure = true;
+            }
+        }
+
+        // rebuild after an edit-save or a display change (with fallback prompts)
+        if (g_reconfigure) {
+            g_reconfigure = false;
+            if (!ensureConfigured(m, L"")) { g_running = false; break; }
+        }
+
         if (g_enabled) {
-            if (m.waitable) WaitForSingleObjectEx(m.waitable, 100, TRUE);  // pace to present
-            m.renderFrame();                                               // AcquireNextFrame paces capture
+            if (m.waitable) WaitForSingleObjectEx(m.waitable, 100, TRUE);
+            if (g_cfg.fps > 0) {
+                double minSec = 1.0 / g_cfg.fps;
+                LARGE_INTEGER now; QueryPerformanceCounter(&now);
+                double dt = double(now.QuadPart - last.QuadPart) / freq.QuadPart;
+                if (dt < minSec) {
+                    DWORD ms = (DWORD)((minSec - dt) * 1000.0);
+                    if (ms > 0) Sleep(ms);
+                }
+                QueryPerformanceCounter(&last);
+            }
+            m.renderFrame();
         } else {
-            WaitMessage();   // idle: sleep until a tray message arrives
+            WaitMessage();
         }
     }
 
     removeTray();
+    timeEndPeriod(1);
     return 0;
 }
