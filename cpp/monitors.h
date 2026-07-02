@@ -17,7 +17,8 @@
 #include <vector>
 
 struct MonitorInfo {
-    std::wstring device;      // \\.\DISPLAYx  (stable identifier)
+    std::wstring device;      // \\.\DISPLAYx  (can renumber on re-plug)
+    std::wstring hwid;        // stable hardware id (monitor interface path / EDID-derived)
     RECT         rect{};      // desktop coordinates (physical pixels)
     bool         primary = false;
     UINT         adapterIdx = 0;
@@ -61,6 +62,12 @@ inline std::vector<MonitorInfo> EnumMonitors() {
             mi.primary    = (d.DesktopCoordinates.left == 0 && d.DesktopCoordinates.top == 0);
             mi.adapterIdx = ai;
             mi.outputIdx  = oi;
+            // stable hardware id: the monitor interface path (contains the EDID
+            // manufacturer/product and a per-connection instance), which survives
+            // \\.\DISPLAYx renumbering when displays are re-plugged.
+            DISPLAY_DEVICEW dd = {}; dd.cb = sizeof(dd);
+            if (EnumDisplayDevicesW(d.DeviceName, 0, &dd, EDD_GET_DEVICE_INTERFACE_NAME) && dd.DeviceID[0])
+                mi.hwid = dd.DeviceID;
             mons.push_back(mi);
         }
     }

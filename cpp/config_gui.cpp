@@ -25,6 +25,7 @@ enum {
     ID_SRC_X = 110, ID_SRC_Y, ID_SRC_W, ID_SRC_H,
     ID_TGT_X = 120, ID_TGT_Y, ID_TGT_W, ID_TGT_H,
     ID_FPS = 130, ID_VSYNC, ID_CURSOR, ID_COVER,
+    ID_ROT, ID_FLIPH, ID_FLIPV, ID_WINDOWED, ID_LOG,
     ID_SAVE = 140, ID_IMPORT, ID_EXPORT, ID_QUIT
 };
 static const UINT WM_CANVAS_CHANGED = WM_APP + 20;   // wParam: 0=source, 1=target
@@ -109,11 +110,32 @@ static RECT centeredRatioBox(const MonitorInfo& m, double frac, double asp){
     return { x, y, x + iw, y + ih };
 }
 
+// snap region edges to the monitor edges / centre when within a few pixels.
+static void snapRect(Canvas* c, RECT& r, bool moving){
+    int mw = c->mon->w(), mh = c->mon->h();
+    int thr = (int)(7.0 / (c->scale > 0 ? c->scale : 1.0)); if (thr < 2) thr = 2;
+    auto nr = [&](int a, int b){ return abs(a - b) <= thr; };
+    if (moving){
+        int w = r.right - r.left, h = r.bottom - r.top;
+        if      (nr(r.left, 0))                 { r.left = 0;      r.right = w; }
+        else if (nr(r.right, mw))               { r.right = mw;    r.left = mw - w; }
+        else if (nr((r.left+r.right)/2, mw/2))  { r.left = mw/2 - w/2; r.right = r.left + w; }
+        if      (nr(r.top, 0))                  { r.top = 0;       r.bottom = h; }
+        else if (nr(r.bottom, mh))              { r.bottom = mh;   r.top = mh - h; }
+        else if (nr((r.top+r.bottom)/2, mh/2))  { r.top = mh/2 - h/2; r.bottom = r.top + h; }
+    } else {
+        if (nr(r.left, 0))   r.left = 0;
+        if (nr(r.right, mw)) r.right = mw;
+        if (nr(r.top, 0))    r.top = 0;
+        if (nr(r.bottom, mh))r.bottom = mh;
+    }
+}
+
 // resize with the aspect ratio preserved, anchored at the corner opposite `h`.
-static void resizeRatio(Canvas* c, int h, int mx, int my){
+static void resizeRatio(Canvas* c, int h, int mx, int my, double asp){
     const RECT r0 = c->dragRegion0;
     int mw = c->mon->w(), mh = c->mon->h();
-    double asp = c->lockAspect; if (asp <= 0) asp = 1;
+    if (asp <= 0) asp = 1;
     int anchorX, anchorY;   // fixed corner
     int signX, signY;       // +1 grows right/down from anchor, -1 grows left/up
     switch (h){
@@ -146,6 +168,7 @@ static void resizeFree(Canvas* c, int h, int mx, int my){
     if (h==0||h==1||h==2) r.top    = my;   // top edge
     if (h==4||h==5||h==6) r.bottom = my;   // bottom edge
     normalize(r);
+    snapRect(c, r, false);
     clampInside(r, mw, mh);
     c->region = r;
 }
@@ -154,6 +177,18 @@ static void moveRegion(Canvas* c, int mx, int my){
     RECT r = c->dragRegion0;
     int mw = c->mon->w(), mh = c->mon->h();
     int dx = mx - c->dragMouse0.x, dy = my - c->dragMouse0.y;
+    r.left += dx; r.right += dx; r.top += dy; r.bottom += dy;
+    if (r.left < 0){ r.right -= r.left; r.left = 0; }
+    if (r.top  < 0){ r.bottom -= r.top; r.top = 0; }
+    if (r.right  > mw){ int o = r.right - mw; r.left -= o; r.right -= o; }
+    if (r.bottom > mh){ int o = r.bottom - mh; r.top -= o; r.bottom -= o; }
+    c->region = r;
+}
+
+// nudge / clamp-shift the whole region by (dx,dy) monitor px (arrow keys).
+static void nudgeRegion(Canvas* c, int dx, int dy){
+    int mw = c->mon->w(), mh = c->mon->h();
+    RECT r = c->region;
     r.left += dx; r.right += dx; r.top += dy; r.bottom += dy;
     if (r.left < 0){ r.right -= r.left; r.left = 0; }
     if (r.top  < 0){ r.bottom -= r.top; r.top = 0; }
@@ -256,8 +291,10 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     switch (msg){
     case WM_PAINT: if (c) paintCanvas(c); return 0;
     case WM_ERASEBKGND: return 1;
+    case WM_GETDLGCODE: return DLGC_WANTARROWS;   // let arrow keys reach us for nudging
     case WM_LBUTTONDOWN: {
         if (!c || !c->mon) return 0;
+        SetFocus(hwnd);                            // so arrow-key nudging works after a click
         int h = hitTest(c, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
         if (h < 0) return 0;
         c->dragMode = h;
@@ -274,9 +311,28 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             SetCursor(LoadCursorW(nullptr, cursorFor(h)));
             return 0;
         }
-        if (c->dragMode == 8)                    moveRegion(c, mm.x, mm.y);
-        else if (c->ratioLocked)                 resizeRatio(c, c->dragMode, mm.x, mm.y);
-        else                                     resizeFree(c, c->dragMode, mm.x, mm.y);
+        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (c->dragMode == 8)          moveRegion(c, mm.x, mm.y);
+        else if (c->ratioLocked)       resizeRatio(c, c->dragMode, mm.x, mm.y, c->lockAspect);
+        else if (shift && isCorner(c->dragMode)){   // hold Shift = keep the working area's shape
+            const RECT& r0 = c->dragRegion0;
+            double a = (r0.bottom > r0.top) ? (double)(r0.right - r0.left) / (r0.bottom - r0.top) : 1.0;
+            resizeRatio(c, c->dragMode, mm.x, mm.y, a);
+        } else                         resizeFree(c, c->dragMode, mm.x, mm.y);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        SendMessageW(c->parent, WM_CANVAS_CHANGED, (WPARAM)c->which, 0);
+        return 0;
+    }
+    case WM_KEYDOWN: {
+        if (!c || !c->mon) return 0;
+        int step = (GetKeyState(VK_SHIFT) & 0x8000) ? 10 : 1;
+        int dx = 0, dy = 0;
+        if      (wp == VK_LEFT)  dx = -step;
+        else if (wp == VK_RIGHT) dx =  step;
+        else if (wp == VK_UP)    dy = -step;
+        else if (wp == VK_DOWN)  dy =  step;
+        else return 0;
+        nudgeRegion(c, dx, dy);
         InvalidateRect(hwnd, nullptr, FALSE);
         SendMessageW(c->parent, WM_CANVAS_CHANGED, (WPARAM)c->which, 0);
         return 0;
@@ -305,12 +361,28 @@ struct DlgState {
     HWND hSrcX=0,hSrcY=0,hSrcW=0,hSrcH=0;
     HWND hTgtX=0,hTgtY=0,hTgtW=0,hTgtH=0;
     HWND hFps=0, hVsync=0, hCursor=0, hCover=0;
+    HWND hRot=0, hFlipH=0, hFlipV=0, hWindowed=0, hLog=0;
     HWND hover=nullptr;          // button currently hovered (for owner-draw)
     std::wstring banner;         // info/error strip text (painted, not a control)
 };
 
 static void setInt(HWND e, int v){ wchar_t b[16]; swprintf(b,16,L"%d",v); SetWindowTextW(e,b); }
 static int  getInt(HWND e){ wchar_t b[16]={0}; GetWindowTextW(e,b,16); return _wtoi(b); }
+
+// rotation currently selected in the dialog (degrees), and the resulting
+// aspect the target box must have (rotation by 90/270 swaps w/h).
+static int dlgRotation(DlgState* s){
+    int i = (int)SendMessageW(s->hRot, CB_GETCURSEL, 0, 0);
+    return (i <= 0) ? 0 : i * 90;
+}
+static double dlgEffAspect(DlgState* s){
+    int w = s->src.region.right - s->src.region.left;
+    int h = s->src.region.bottom - s->src.region.top;
+    if (w <= 0 || h <= 0) return 1.0;
+    double a = (double)w / h;
+    int rot = dlgRotation(s);
+    return (rot == 90 || rot == 270) ? 1.0 / a : a;
+}
 
 static void writeSrcFields(DlgState* s){
     s->syncing = true;
@@ -329,12 +401,10 @@ static void writeTgtFields(DlgState* s){
     s->syncing = false;
 }
 
-// re-shape the target box to the source aspect (keep its top-left & width, clamp)
+// re-shape the target box to the (rotation-adjusted) source aspect
 static void refitTarget(DlgState* s){
     if (!s->tgt.mon) return;
-    double asp = s->src.region.bottom > s->src.region.top
-        ? (double)(s->src.region.right - s->src.region.left) /
-          (s->src.region.bottom - s->src.region.top) : 1.0;
+    double asp = dlgEffAspect(s);
     s->tgt.lockAspect = asp;
     int mw = s->tgt.mon->w(), mh = s->tgt.mon->h();
     RECT& r = s->tgt.region;
@@ -347,8 +417,7 @@ static void refitTarget(DlgState* s){
     if (r.bottom > mh){ int o = r.bottom - mh; r.top -= o; r.bottom -= o; if (r.top<0) r.top=0; }
 }
 
-static void selectMonitorInCombo(HWND combo, const std::vector<MonitorInfo>& mons, const std::wstring& dev){
-    int idx = FindMonitor(mons, dev);
+static void selectMonitorIdx(HWND combo, int idx){
     SendMessageW(combo, CB_SETCURSEL, idx < 0 ? (WPARAM)-1 : (WPARAM)idx, 0);
 }
 
@@ -366,10 +435,10 @@ static void setTargetEnabled(DlgState* s, bool on){
 // load all controls from a MirrorConfig
 static void controlsFromConfig(DlgState* s, const MirrorConfig& c){
     const auto& mons = *s->mons;
-    selectMonitorInCombo(s->hSrcCombo, mons, c.source.device);
-    selectMonitorInCombo(s->hTgtCombo, mons, c.target.device);
-    int si = FindMonitor(mons, c.source.device);
-    int ti = FindMonitor(mons, c.target.device);
+    int si = ResolveMonitor(mons, c.source);   // stable hwid first, device name fallback
+    int ti = ResolveMonitor(mons, c.target);
+    selectMonitorIdx(s->hSrcCombo, si);
+    selectMonitorIdx(s->hTgtCombo, ti);
     s->src.mon = si >= 0 ? &mons[si] : nullptr;
     s->tgt.mon = ti >= 0 ? &mons[ti] : nullptr;
 
@@ -381,24 +450,28 @@ static void controlsFromConfig(DlgState* s, const MirrorConfig& c){
             s->src.region = r;
         }
     }
-    double srcAsp = (s->src.region.bottom > s->src.region.top)
-        ? (double)(s->src.region.right - s->src.region.left) /
-          (s->src.region.bottom - s->src.region.top) : 1.0;
+    // options (rotation set before computing the target's default aspect)
+    setInt(s->hFps, c.fps);
+    SendMessageW(s->hVsync,  BM_SETCHECK, c.vsync  ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(s->hCursor, BM_SETCHECK, c.cursor ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(s->hCover,  BM_SETCHECK, c.cover  ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(s->hRot, CB_SETCURSEL, (WPARAM)(c.rotation / 90), 0);
+    SendMessageW(s->hFlipH, BM_SETCHECK, c.flipH ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(s->hFlipV, BM_SETCHECK, c.flipV ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(s->hWindowed, BM_SETCHECK, c.windowed ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(s->hLog, BM_SETCHECK, c.log ? BST_CHECKED : BST_UNCHECKED, 0);
+
     if (s->tgt.mon){
-        if (c.target.w <= 0) s->tgt.region = centeredRatioBox(*s->tgt.mon, 0.5, srcAsp);
+        if (c.target.w <= 0) s->tgt.region = centeredRatioBox(*s->tgt.mon, 0.5, dlgEffAspect(s));
         else {
             RECT r = { c.target.x, c.target.y, c.target.x + c.target.w, c.target.y + c.target.h };
             clampInside(r, s->tgt.mon->w(), s->tgt.mon->h());
             s->tgt.region = r;
         }
     }
-    setInt(s->hFps, c.fps);
-    SendMessageW(s->hVsync,  BM_SETCHECK, c.vsync  ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(s->hCursor, BM_SETCHECK, c.cursor ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(s->hCover,  BM_SETCHECK, c.cover  ? BST_CHECKED : BST_UNCHECKED, 0);
     refitTarget(s);
     setTargetEnabled(s, s->src.mon != nullptr);
-    if (s->src.mon) selectMonitorInCombo(s->hTgtCombo, mons, c.target.device);  // re-apply after enable
+    if (s->src.mon) selectMonitorIdx(s->hTgtCombo, ti);   // re-apply after enable
     writeSrcFields(s); writeTgtFields(s);
     InvalidateRect(s->src.hwnd, nullptr, FALSE);
     InvalidateRect(s->tgt.hwnd, nullptr, FALSE);
@@ -409,8 +482,8 @@ static bool configFromControls(DlgState* s, MirrorConfig& c){
     int ti = (int)SendMessageW(s->hTgtCombo, CB_GETCURSEL, 0, 0);
     if (si < 0 || ti < 0) return false;
     const auto& mons = *s->mons;
-    c.source.device = mons[si].device;
-    c.target.device = mons[ti].device;
+    c.source.device = mons[si].device; c.source.hwid = mons[si].hwid;
+    c.target.device = mons[ti].device; c.target.hwid = mons[ti].hwid;
     c.source.x = s->src.region.left; c.source.y = s->src.region.top;
     c.source.w = s->src.region.right - s->src.region.left;
     c.source.h = s->src.region.bottom - s->src.region.top;
@@ -418,9 +491,14 @@ static bool configFromControls(DlgState* s, MirrorConfig& c){
     c.target.w = s->tgt.region.right - s->tgt.region.left;
     c.target.h = s->tgt.region.bottom - s->tgt.region.top;
     c.fps = clampi(getInt(s->hFps), 0, 1000);
-    c.vsync  = SendMessageW(s->hVsync,  BM_GETCHECK, 0, 0) == BST_CHECKED;
-    c.cursor = SendMessageW(s->hCursor, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    c.cover  = SendMessageW(s->hCover,  BM_GETCHECK, 0, 0) == BST_CHECKED;
+    c.vsync    = SendMessageW(s->hVsync,    BM_GETCHECK, 0, 0) == BST_CHECKED;
+    c.cursor   = SendMessageW(s->hCursor,   BM_GETCHECK, 0, 0) == BST_CHECKED;
+    c.cover    = SendMessageW(s->hCover,    BM_GETCHECK, 0, 0) == BST_CHECKED;
+    c.windowed = SendMessageW(s->hWindowed, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    c.flipH    = SendMessageW(s->hFlipH,    BM_GETCHECK, 0, 0) == BST_CHECKED;
+    c.flipV    = SendMessageW(s->hFlipV,    BM_GETCHECK, 0, 0) == BST_CHECKED;
+    c.log      = SendMessageW(s->hLog,      BM_GETCHECK, 0, 0) == BST_CHECKED;
+    c.rotation = dlgRotation(s);
     return true;
 }
 
@@ -493,7 +571,8 @@ enum {
     LO_CARD_H = 312,
     LO_PAD = 16,
     LO_OPT_Y = LO_CARD_Y + LO_CARD_H + 16,
-    LO_BTN_Y = LO_OPT_Y + 44 + 14
+    LO_OPT_H = 84,                       // options card holds two rows
+    LO_BTN_Y = LO_OPT_Y + LO_OPT_H + 14
 };
 
 static HWND makeLabel(HWND p, HINSTANCE hi, LPCWSTR t, int x, int y, int w, int h, HFONT f = nullptr){
@@ -626,14 +705,26 @@ static void createControls(HWND hwnd, DlgState* s, HINSTANCE hi, const std::wstr
         SendMessageW(s->hTgtCombo, CB_ADDSTRING, 0, (LPARAM)m.label().c_str());
     }
 
-    // ---- options row (on its own full-width card) ----
-    int ox = LO_CARD_AX + LO_PAD, oy = LO_OPT_Y + 12;
+    // ---- options card: two rows ----
+    int ox = LO_CARD_AX + LO_PAD, oy = LO_OPT_Y + 10, oy2 = LO_OPT_Y + 46;
+    // row 1
     makeLabel(hwnd, hi, L"Frame rate (FPS)", ox, oy + 2, 118, 22);
     s->hFps    = makeEdit (hwnd, hi, ID_FPS, ox + 120, oy, 56, 24);
     makeLabel(hwnd, hi, L"0 = uncapped", ox + 182, oy + 2, 96, 22);
     s->hVsync  = makeCheck(hwnd, hi, ID_VSYNC,  L"V-Sync",           ox + 300, oy + 2, 88,  22);
     s->hCursor = makeCheck(hwnd, hi, ID_CURSOR, L"Show cursor",      ox + 396, oy + 2, 128, 22);
     s->hCover  = makeCheck(hwnd, hi, ID_COVER,  L"Black background", ox + 540, oy + 2, 180, 22);
+    // row 2
+    makeLabel(hwnd, hi, L"Rotation", ox, oy2 + 2, 66, 22);
+    s->hRot = CreateWindowExW(0, L"COMBOBOX", L"",
+        WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST, ox + 68, oy2, 84, 160, hwnd, (HMENU)ID_ROT, hi, nullptr);
+    SendMessageW(s->hRot, WM_SETFONT, (WPARAM)g_font, TRUE);
+    for (LPCWSTR r : { L"0°", L"90°", L"180°", L"270°" }) SendMessageW(s->hRot, CB_ADDSTRING, 0, (LPARAM)r);
+    SendMessageW(s->hRot, CB_SETCURSEL, 0, 0);
+    s->hFlipH    = makeCheck(hwnd, hi, ID_FLIPH,    L"Flip H",          ox + 168, oy2 + 2, 78,  22);
+    s->hFlipV    = makeCheck(hwnd, hi, ID_FLIPV,    L"Flip V",          ox + 250, oy2 + 2, 78,  22);
+    s->hWindowed = makeCheck(hwnd, hi, ID_WINDOWED, L"Floating window", ox + 336, oy2 + 2, 168, 22);
+    s->hLog      = makeCheck(hwnd, hi, ID_LOG,      L"Log to file",     ox + 512, oy2 + 2, 130, 22);
 
     // ---- buttons ----
     int by = LO_BTN_Y, right = LO_CARD_BX + LO_CARD_W;
@@ -683,7 +774,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         // cards
         drawCard(mem, LO_CARD_AX, LO_CARD_Y, LO_CARD_W, LO_CARD_H);
         drawCard(mem, LO_CARD_BX, LO_CARD_Y, LO_CARD_W, LO_CARD_H);
-        drawCard(mem, LO_CARD_AX, LO_OPT_Y, LO_CARD_BX + LO_CARD_W - LO_CARD_AX, 44);
+        drawCard(mem, LO_CARD_AX, LO_OPT_Y, LO_CARD_BX + LO_CARD_W - LO_CARD_AX, LO_OPT_H);
 
         BitBlt(dc, 0, 0, cr.right, cr.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, ob); DeleteObject(bmp); DeleteDC(mem);
@@ -727,15 +818,18 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             } else {                                                 // target
                 s->tgt.mon = (sel >= 0) ? &mons[sel] : nullptr;
                 if (s->tgt.mon){
-                    double asp = (s->src.region.bottom > s->src.region.top)
-                        ? (double)(s->src.region.right - s->src.region.left) /
-                          (s->src.region.bottom - s->src.region.top) : 1.0;
+                    double asp = dlgEffAspect(s);
                     s->tgt.lockAspect = asp;
                     s->tgt.region = centeredRatioBox(*s->tgt.mon, 0.5, asp);  // centred, 50%, locked ratio
                 }
                 writeTgtFields(s);
                 InvalidateRect(s->tgt.hwnd, nullptr, FALSE);
             }
+            return 0;
+        }
+        if (code == CBN_SELCHANGE && id == ID_ROT){   // rotation changes the target's shape
+            refitTarget(s); writeTgtFields(s);
+            InvalidateRect(s->tgt.hwnd, nullptr, FALSE);
             return 0;
         }
         if (code == EN_CHANGE && !s->syncing){

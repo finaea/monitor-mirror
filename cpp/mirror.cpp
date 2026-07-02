@@ -37,6 +37,7 @@
 #include <vector>
 #include <string>
 #include <cstdio>
+#include <cmath>
 #include <algorithm>
 
 #include "monitors.h"
@@ -62,16 +63,56 @@ static bool        g_enabled = true;
 static bool        g_running = true;
 static bool        g_reconfigure = false;   // rebuild pipeline (display change / edit-save)
 static bool        g_showConfig  = false;   // open the setup dialog next loop iteration
+static bool        g_recreating  = false;   // suppress quit while recreating the window
+static bool        g_trayAdded   = false;
+static int         g_resizeW = 0, g_resizeH = 0;   // pending windowed client resize (0 = none)
 
 static MirrorConfig            g_cfg;
 static std::vector<MonitorInfo> g_monitors;
 static std::wstring            g_cfgPath;
 
 // ----------------------------------------------------------------------------
+// Logging: always to the debugger; optionally to mirror.log next to the exe.
+// ----------------------------------------------------------------------------
+static FILE* g_logFile = nullptr;
 static void logf(const char* fmt, ...) {
     char buf[512]; va_list ap; va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
     OutputDebugStringA(buf); OutputDebugStringA("\n");
+    if (g_logFile) {
+        SYSTEMTIME t; GetLocalTime(&t);
+        fprintf(g_logFile, "[%02d:%02d:%02d.%03d] %s\n",
+                t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, buf);
+        fflush(g_logFile);
+    }
+}
+static void openLog(bool on) {
+    if (on && !g_logFile) {
+        std::wstring p = ExeDir() + L"\\mirror.log";
+        g_logFile = _wfopen(p.c_str(), L"a");
+        if (g_logFile) {
+            SYSTEMTIME t; GetLocalTime(&t);
+            fprintf(g_logFile, "\n=== mirror started %04d-%02d-%02d %02d:%02d:%02d ===\n",
+                    t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+            fflush(g_logFile);
+        }
+    } else if (!on && g_logFile) {
+        fclose(g_logFile); g_logFile = nullptr;
+    }
+}
+
+// output corner -> source corner UVs for a rotation (cw) + optional flips.
+// Output vertex order (matches the VS): 0=TL, 1=TR, 2=BL, 3=BR.
+static void computeUVs(int rot, bool fh, bool fv, float out[8]) {
+    static const float su[4] = {0,1,0,1}, sv[4] = {0,0,1,1};   // src TL,TR,BL,BR
+    static const int p0[4]={0,1,2,3}, p90[4]={2,0,3,1}, p180[4]={3,2,1,0}, p270[4]={1,3,0,2};
+    const int* p = rot==90 ? p90 : rot==180 ? p180 : rot==270 ? p270 : p0;
+    for (int i = 0; i < 4; ++i) {
+        float u = su[p[i]], v = sv[p[i]];
+        if (fh) u = 1.f - u;
+        if (fv) v = 1.f - v;
+        out[i*2] = u; out[i*2+1] = v;
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -106,29 +147,38 @@ struct Mirror {
 
     // geometry (derived from config), all in physical pixels
     int cropX=0, cropY=0, cropW=0, cropH=0;   // region on the working monitor
-    int winW=0, winH=0;                        // window == full mirror monitor
+    int winW=0, winH=0;                        // backbuffer / window client size
     int drawX=0, drawY=0, drawW=0, drawH=0;    // where the mirror is drawn in the window
     bool vsync=false, showCursor=true;
     bool scaling=false;
+    // presentation options
+    bool windowed=false;                       // floating resizable window
+    int  rotation=0; bool flipH=false, flipV=false;
+    double drawAspect=1.0;                     // rotation-adjusted w:h of the mirror
+    float uvRot[8]={0,0,1,0,0,1,1,1};          // per-corner UVs (rotation/flip baked in)
+    UINT swapFlags=0;                          // remembered for ResizeBuffers
 
     bool init(const MirrorConfig& cfg, const std::vector<MonitorInfo>& mons, HWND hwnd, std::wstring& err);
     bool createDuplication();
     bool createPipeline();
+    void fitDrawRect();                        // contain-fit drawAspect into winW x winH (windowed)
+    bool resize(int w, int h);                 // windowed live resize
     void renderFrame();
     void updateCursor(IDXGIOutputDuplication* d, const DXGI_OUTDUPL_FRAME_INFO& fi);
     void buildCursorTexture(const std::vector<BYTE>& bgra, int w, int h);
 };
 
-struct CB { float posRect[4]; float uvRect[4]; };
+struct CB { float posRect[4]; float uv[8]; };  // posRect + 4 corner UVs
 
 static const char* kVS =
-"cbuffer CB:register(b0){float4 posRect;float4 uvRect;};"
+"cbuffer CB:register(b0){float4 posRect;float4 uvA;float4 uvB;};"
 "struct VO{float4 pos:SV_Position;float2 uv:TEXCOORD;};"
 "VO main(uint vid:SV_VertexID){"
 " float2 g=float2((vid&1),(vid>>1));"
+" float2 uvs[4]={uvA.xy,uvA.zw,uvB.xy,uvB.zw};"
 " VO o;"
 " o.pos=float4(lerp(posRect.x,posRect.z,g.x),lerp(posRect.y,posRect.w,g.y),0,1);"
-" o.uv =float2(lerp(uvRect.x,uvRect.z,g.x),lerp(uvRect.y,uvRect.w,g.y));"
+" o.uv =uvs[vid];"
 " return o;}";
 static const char* kPS =
 "Texture2D tex:register(t0);SamplerState smp:register(s0);"
@@ -139,11 +189,11 @@ static const char* kPS =
 // Build all geometry + D3D resources from the config. Returns false + reason.
 // ----------------------------------------------------------------------------
 bool Mirror::init(const MirrorConfig& cfg, const std::vector<MonitorInfo>& mons, HWND hwnd, std::wstring& err) {
-    int si = FindMonitor(mons, cfg.source.device);
-    int ti = FindMonitor(mons, cfg.target.device);
+    int si = ResolveMonitor(mons, cfg.source);
+    int ti = ResolveMonitor(mons, cfg.target);
     if (si < 0 || ti < 0) { err = L"A configured monitor is not connected."; return false; }
 
-    // ---- find the DXGI output matching the working monitor's device name ----
+    // ---- find the DXGI output for the working monitor (by current device name) ----
     ComPtr<IDXGIFactory1> factory;
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)factory.GetAddressOf()))) {
         err = L"Direct3D initialization failed (CreateDXGIFactory1)."; return false; }
@@ -154,7 +204,7 @@ bool Mirror::init(const MirrorConfig& cfg, const std::vector<MonitorInfo>& mons,
         for (UINT oi = 0; ad->EnumOutputs(oi, o.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; ++oi) {
             DXGI_OUTPUT_DESC d; o->GetDesc(&d);
             if (!d.AttachedToDesktop) continue;
-            if (cfg.source.device == d.DeviceName) {
+            if (mons[si].device == d.DeviceName) {
                 srcAdapter = ad; o.As(&srcOutput); found = true; break;
             }
         }
@@ -162,23 +212,33 @@ bool Mirror::init(const MirrorConfig& cfg, const std::vector<MonitorInfo>& mons,
     if (!found || !srcOutput) { err = L"Could not open the working monitor for capture."; return false; }
 
     // ---- geometry ----
-    // cover=true : the window fills the whole mirror monitor, mirror drawn as a
-    //              sub-rectangle with black margins around it.
-    // cover=false: the window is exactly the mirror rectangle, so the rest of the
-    //              monitor (desktop / other apps) stays visible.
     cropX = cfg.source.x; cropY = cfg.source.y; cropW = cfg.source.w; cropH = cfg.source.h;
-    drawW = cfg.target.w; drawH = cfg.target.h;
-    if (cfg.cover) {
-        winW = mons[ti].w(); winH = mons[ti].h();
-        drawX = cfg.target.x; drawY = cfg.target.y;
-    } else {
+    vsync = cfg.vsync; showCursor = cfg.cursor;
+    windowed = cfg.windowed; rotation = cfg.rotation; flipH = cfg.flipH; flipV = cfg.flipV;
+    computeUVs(rotation, flipH, flipV, uvRot);
+    drawAspect = (rotation == 90 || rotation == 270)
+        ? (cropW ? (double)cropH / cropW : 1.0)
+        : (cropH ? (double)cropW / cropH : 1.0);
+
+    if (windowed) {
+        // floating window: client == mirror rectangle size; letterboxed inside.
         winW = cfg.target.w; winH = cfg.target.h;
-        drawX = 0; drawY = 0;
+        fitDrawRect();
+    } else if (cfg.cover) {
+        // fill the mirror monitor black; mirror drawn as a sub-rectangle.
+        winW = mons[ti].w(); winH = mons[ti].h();
+        drawX = cfg.target.x; drawY = cfg.target.y; drawW = cfg.target.w; drawH = cfg.target.h;
+    } else {
+        // window is exactly the mirror rectangle; desktop around it shows through.
+        winW = cfg.target.w; winH = cfg.target.h;
+        drawX = 0; drawY = 0; drawW = cfg.target.w; drawH = cfg.target.h;
     }
-    vsync = cfg.vsync;     showCursor = cfg.cursor;
-    scaling = (cropW != drawW) || (cropH != drawH);
-    logf("crop=(%d,%d %dx%d)  win=%dx%d  draw=(%d,%d %dx%d)  scaling=%d",
-         cropX, cropY, cropW, cropH, winW, winH, drawX, drawY, drawW, drawH, scaling);
+    bool oneToOne = (rotation % 180 == 0) ? (drawW == cropW && drawH == cropH)
+                                          : (drawW == cropH && drawH == cropW);
+    scaling = !oneToOne;
+    logf("init: crop=(%d,%d %dx%d) win=%dx%d draw=(%d,%d %dx%d) rot=%d flip=%d%d windowed=%d scaling=%d",
+         cropX, cropY, cropW, cropH, winW, winH, drawX, drawY, drawW, drawH,
+         rotation, flipH, flipV, windowed, scaling);
 
     // ---- device on the source adapter ----
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
@@ -195,6 +255,31 @@ bool Mirror::init(const MirrorConfig& cfg, const std::vector<MonitorInfo>& mons,
 bool Mirror::createDuplication() {
     dupl.Reset();
     return SUCCEEDED(srcOutput->DuplicateOutput(dev.Get(), dupl.GetAddressOf()));
+}
+
+// contain-fit the (rotation-adjusted) mirror aspect into the client, centred.
+void Mirror::fitDrawRect() {
+    double a = drawAspect > 0 ? drawAspect : 1.0;
+    if (winW <= 0 || winH <= 0) { drawX = drawY = 0; drawW = winW; drawH = winH; return; }
+    if ((double)winW / winH > a) { drawH = winH; drawW = (int)llround(winH * a); }
+    else                         { drawW = winW; drawH = (int)llround(winW / a); }
+    drawX = (winW - drawW) / 2; drawY = (winH - drawH) / 2;
+}
+
+// windowed live resize: resize the swapchain buffers and re-fit the mirror.
+bool Mirror::resize(int w, int h) {
+    if (!swap || w < 16 || h < 16) return false;
+    rtv.Reset();
+    if (FAILED(swap->ResizeBuffers(0, (UINT)w, (UINT)h, DXGI_FORMAT_UNKNOWN, swapFlags))) return false;
+    ComPtr<ID3D11Texture2D> bb;
+    if (FAILED(swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)bb.GetAddressOf()))) return false;
+    if (FAILED(dev->CreateRenderTargetView(bb.Get(), nullptr, rtv.GetAddressOf()))) return false;
+    winW = w; winH = h;
+    fitDrawRect();
+    bool oneToOne = (rotation % 180 == 0) ? (drawW == cropW && drawH == cropH)
+                                          : (drawW == cropH && drawH == cropW);
+    scaling = !oneToOne;
+    return true;
 }
 
 bool Mirror::createPipeline() {
@@ -219,6 +304,7 @@ bool Mirror::createPipeline() {
     sc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
     sc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     if (allowTearing) sc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    swapFlags = sc.Flags;
 
     ComPtr<IDXGISwapChain1> sc1;
     if (FAILED(f2->CreateSwapChainForHwnd(dev.Get(), g_hwnd, &sc, nullptr, nullptr, sc1.GetAddressOf())))
@@ -374,31 +460,48 @@ void Mirror::renderFrame() {
     ctx->PSSetSamplers(0, 1, &smp);
     float bf[4] = {0,0,0,0};
 
-    // window-pixel rect -> NDC
-    auto pxQuad = [&](float x, float y, float w, float h, ID3D11ShaderResourceView* srv, ID3D11BlendState* bs){
+    // window-pixel rect + per-corner UVs -> NDC quad
+    auto pxQuad = [&](float x, float y, float w, float h, const float uv[8],
+                      ID3D11ShaderResourceView* srv, ID3D11BlendState* bs){
         float x0 =  (x        / winW) * 2.f - 1.f;
         float x1 = ((x + w)   / winW) * 2.f - 1.f;
         float y0 = 1.f - (y        / winH) * 2.f;
         float y1 = 1.f - ((y + h)  / winH) * 2.f;
         D3D11_MAPPED_SUBRESOURCE ms; ctx->Map(cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
-        CB c = { {x0,y0,x1,y1}, {0,0,1,1} }; memcpy(ms.pData, &c, sizeof(c)); ctx->Unmap(cb.Get(), 0);
+        CB c; c.posRect[0]=x0; c.posRect[1]=y0; c.posRect[2]=x1; c.posRect[3]=y1;
+        memcpy(c.uv, uv, sizeof(float) * 8);
+        memcpy(ms.pData, &c, sizeof(c)); ctx->Unmap(cb.Get(), 0);
         ctx->VSSetConstantBuffers(0, 1, cb.GetAddressOf());
         ctx->PSSetShaderResources(0, 1, &srv);
         ctx->OMSetBlendState(bs, bf, 0xffffffff);
         ctx->Draw(4, 0);
     };
 
-    // base: the mirrored region, scaled into the draw rectangle
-    pxQuad((float)drawX, (float)drawY, (float)drawW, (float)drawH, cropSRV.Get(), blendOpaque.Get());
+    // map a normalized source point (0..1) into normalized OUTPUT space (rotation+flip)
+    auto Txf = [&](float nx, float ny, float& ox, float& oy){
+        switch (rotation) {
+            case 90:  ox = 1.f - ny; oy = nx;        break;
+            case 180: ox = 1.f - nx; oy = 1.f - ny;  break;
+            case 270: ox = ny;       oy = 1.f - nx;  break;
+            default:  ox = nx;       oy = ny;        break;
+        }
+        if (flipH) ox = 1.f - ox;
+        if (flipV) oy = 1.f - oy;
+    };
 
-    // cursor: map from source pixels into the draw rectangle (same scale)
+    // base: the mirrored region, rotated/flipped into the draw rectangle
+    pxQuad((float)drawX, (float)drawY, (float)drawW, (float)drawH, uvRot, cropSRV.Get(), blendOpaque.Get());
+
+    // cursor: transform its source-space bounding box the same way, rotate the bitmap to match
     if (showCursor && curVisible && curSRV && curW > 0 && cropW > 0 && cropH > 0) {
-        float sx = (float)drawW / cropW, sy = (float)drawH / cropH;
-        float rx = (curX - cropX) * sx + drawX;
-        float ry = (curY - cropY) * sy + drawY;
-        float rw = curW * sx, rh = curH * sy;
+        float nx0 = (curX - cropX) / (float)cropW, ny0 = (curY - cropY) / (float)cropH;
+        float nx1 = (curX - cropX + curW) / (float)cropW, ny1 = (curY - cropY + curH) / (float)cropH;
+        float ax, ay, bx, by; Txf(nx0, ny0, ax, ay); Txf(nx1, ny1, bx, by);
+        float ox0 = std::min(ax,bx), oy0 = std::min(ay,by), ox1 = std::max(ax,bx), oy1 = std::max(ay,by);
+        float rx = drawX + ox0 * drawW, ry = drawY + oy0 * drawH;
+        float rw = (ox1 - ox0) * drawW, rh = (oy1 - oy0) * drawH;
         if (rx + rw > drawX && ry + rh > drawY && rx < drawX + drawW && ry < drawY + drawH)
-            pxQuad(rx, ry, rw, rh, curSRV.Get(), blendAlpha.Get());
+            pxQuad(rx, ry, rw, rh, uvRot, curSRV.Get(), blendAlpha.Get());
     }
 
     UINT flags = (!vsync && allowTearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
@@ -460,7 +563,7 @@ static void removeTray() {
 }
 static void setEnabled(bool on) {
     g_enabled = on;
-    ShowWindow(g_hwnd, on ? SW_SHOWNA : SW_HIDE);
+    ShowWindow(g_hwnd, on ? (g_cfg.windowed ? SW_SHOW : SW_SHOWNA) : SW_HIDE);
     HICON old = g_icon;
     g_icon = makeTrayIcon(on);
     g_nid.uFlags = NIF_ICON | NIF_TIP;
@@ -497,13 +600,41 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) { g_running = false; PostQuitMessage(0); }
         return 0;
+    case WM_SIZE:
+        if (g_cfg.windowed && wp != SIZE_MINIMIZED) {   // queue a live resize
+            g_resizeW = LOWORD(lp); g_resizeH = HIWORD(lp);
+        }
+        return 0;
+    case WM_GETMINMAXINFO: {                             // keep the floating window usable
+        MINMAXINFO* mmi = (MINMAXINFO*)lp;
+        mmi->ptMinTrackSize.x = 160; mmi->ptMinTrackSize.y = 120;
+        return 0;
+    }
+    case WM_CLOSE:
+        if (g_cfg.windowed) { setEnabled(false); return 0; }  // close-to-tray (don't quit)
+        g_running = false; PostQuitMessage(0); return 0;
     case WM_DISPLAYCHANGE:
         g_reconfigure = true;   // resolution / monitor topology changed
         return 0;
     case WM_DESTROY:
+        if (g_recreating) return 0;                      // we're just restyling the window
         g_running = false; PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// Recreate the mirror window with the given style (overlay vs floating). The
+// tray is rebound to the new window; g_recreating stops WM_DESTROY from quitting.
+static void recreateWindow(DWORD style, DWORD ex, int x, int y, int w, int h, const wchar_t* title) {
+    if (g_hwnd) {
+        g_recreating = true;
+        if (g_trayAdded) { removeTray(); g_trayAdded = false; }
+        DestroyWindow(g_hwnd);
+        g_hwnd = nullptr;
+        g_recreating = false;
+    }
+    g_hwnd = CreateWindowExW(ex, kClassName, title, style, x, y, w, h, nullptr, nullptr, g_hInst, nullptr);
+    if (g_hwnd) { addTray(g_hwnd); g_trayAdded = true; }
 }
 
 // ----------------------------------------------------------------------------
@@ -516,26 +647,43 @@ static bool ensureConfigured(Mirror& m, std::wstring banner) {
         g_monitors = EnumMonitors();
         std::wstring err = ValidateConfig(g_cfg, g_monitors);
         if (err.empty()) {
-            // position the window (whole monitor when covering, else just the
-            // mirror rectangle), then build
-            int ti = FindMonitor(g_monitors, g_cfg.target.device);
+            int ti = ResolveMonitor(g_monitors, g_cfg.target);
             const MonitorInfo& tm = g_monitors[ti];
-            int wx, wy, ww, wh;
-            if (g_cfg.cover) {
-                wx = tm.rect.left; wy = tm.rect.top; ww = tm.w(); wh = tm.h();
+            DWORD style, ex; int wx, wy, ww, wh; const wchar_t* title;
+            if (g_cfg.windowed) {
+                // floating, movable/resizable window; client == mirror rectangle
+                style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+                ex = WS_EX_APPWINDOW;
+                RECT rc = { 0, 0, g_cfg.target.w, g_cfg.target.h };
+                AdjustWindowRectEx(&rc, style, FALSE, ex);
+                wx = tm.rect.left + g_cfg.target.x + rc.left;
+                wy = tm.rect.top  + g_cfg.target.y + rc.top;
+                ww = rc.right - rc.left; wh = rc.bottom - rc.top;
+                title = L"Mirror";
             } else {
-                wx = tm.rect.left + g_cfg.target.x; wy = tm.rect.top + g_cfg.target.y;
-                ww = g_cfg.target.w; wh = g_cfg.target.h;
+                // borderless topmost overlay (lowest latency, DWM bypassed)
+                style = WS_POPUP;
+                ex = WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP;
+                if (g_cfg.cover) { wx = tm.rect.left; wy = tm.rect.top; ww = tm.w(); wh = tm.h(); }
+                else { wx = tm.rect.left + g_cfg.target.x; wy = tm.rect.top + g_cfg.target.y;
+                       ww = g_cfg.target.w; wh = g_cfg.target.h; }
+                title = L"mirror";
             }
-            SetWindowPos(g_hwnd, HWND_TOPMOST, wx, wy, ww, wh, SWP_NOACTIVATE);
-            m = Mirror();
-            std::wstring berr;
-            if (m.init(g_cfg, g_monitors, g_hwnd, berr)) {
-                if (g_enabled) ShowWindow(g_hwnd, SW_SHOWNA);
-                return true;
+            recreateWindow(style, ex, wx, wy, ww, wh, title);
+            if (!g_hwnd) { err = L"The mirror window could not be created."; }
+            else {
+                m = Mirror();
+                std::wstring berr;
+                if (m.init(g_cfg, g_monitors, g_hwnd, berr)) {
+                    ShowWindow(g_hwnd, g_enabled ? (g_cfg.windowed ? SW_SHOW : SW_SHOWNA) : SW_HIDE);
+                    g_resizeW = g_resizeH = 0;
+                    logf("configured OK (windowed=%d cover=%d)", g_cfg.windowed, g_cfg.cover);
+                    return true;
+                }
+                err = berr;
             }
-            err = berr;
         }
+        logf("setup needs attention: %ls", err.c_str());
         std::wstring b = !banner.empty() ? banner : err;
         if (RunConfigDialog(g_cfg, g_monitors, g_hInst, b, g_cfgPath) == ConfigResult::Quit)
             return false;
@@ -554,8 +702,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_cfgPath = DefaultConfigPath();
     g_monitors = EnumMonitors();
 
+    // register the mirror window class up front (recreated per mode later)
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = WndProc; wc.hInstance = hInst; wc.lpszClassName = kClassName;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(1));
+    RegisterClassW(&wc);
+
     // ---- first launch / load: prompt to set up or import if missing/invalid ----
     bool loaded = LoadConfig(g_cfg, g_cfgPath);
+    openLog(g_cfg.log);
     std::wstring initialBanner;
     bool needPrompt = false;
     if (!loaded) {
@@ -573,18 +729,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         }
     }
 
-    // ---- window (covers the mirror monitor; repositioned in ensureConfigured) ----
-    WNDCLASSW wc = {};
-    wc.lpfnWndProc = WndProc; wc.hInstance = hInst; wc.lpszClassName = kClassName;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    RegisterClassW(&wc);
-    g_hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP, kClassName, L"mirror",
-        WS_POPUP, 0, 0, 640, 480, nullptr, nullptr, hInst, nullptr);
-    if (!g_hwnd) { MessageBoxW(nullptr, L"CreateWindow failed", L"mirror", MB_ICONERROR); timeEndPeriod(1); return 1; }
-
+    // window + tray are created inside ensureConfigured (style depends on mode)
     Mirror m;
     if (!ensureConfigured(m, L"")) { timeEndPeriod(1); return 0; }
-    addTray(g_hwnd);
 
     LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
     LARGE_INTEGER last = {}; QueryPerformanceCounter(&last);
@@ -602,7 +749,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
             g_showConfig = false;
             MirrorConfig edited = g_cfg;
             if (RunConfigDialog(edited, g_monitors, hInst, L"", g_cfgPath) == ConfigResult::Save) {
-                g_cfg = edited; g_reconfigure = true;
+                g_cfg = edited; openLog(g_cfg.log); g_reconfigure = true;
             }
         }
 
@@ -610,6 +757,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         if (g_reconfigure) {
             g_reconfigure = false;
             if (!ensureConfigured(m, L"")) { g_running = false; break; }
+        }
+
+        // apply a pending floating-window resize
+        if (g_resizeW && g_resizeH) {
+            m.resize(g_resizeW, g_resizeH);
+            g_resizeW = g_resizeH = 0;
         }
 
         if (g_enabled) {
@@ -630,7 +783,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         }
     }
 
-    removeTray();
+    if (g_trayAdded) removeTray();
+    logf("exiting");
+    openLog(false);
     timeEndPeriod(1);
     return 0;
 }
