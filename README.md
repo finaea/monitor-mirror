@@ -27,11 +27,21 @@ Can be use for other purposes such as OBS recording.
 
 ## Demo
 
+![How the working area maps from the tablet to the monitor](preview.png)
+
 Drawing on the pen display (right) shows live on the main monitor (left):
 
-![Monitor Mirror in action](docs/preview.gif)
+▶️ **[Watch the demo](preview.mp4)** (2 MB) · [full-quality `.mov`](preview.mov)
 
-▶️ [Watch the full-quality video](preview.mov) (sharper, original speed).
+<!--
+  WANT AN INLINE VIDEO PLAYER (like other repos)? GitHub only plays videos that
+  were uploaded through its web editor, so this is a one-time manual step:
+    1. Open this README on github.com and click the ✏️ Edit button.
+    2. Click an empty line here, then drag `preview.mp4` (repo root) into the editor.
+    3. GitHub uploads it and inserts a  https://github.com/finaea/monitor-mirror/assets/…
+       URL that renders as an inline player. Commit. (You can then delete the link above.)
+-->
+
 
 ## The setup window
 
