@@ -64,11 +64,11 @@ Quick configurable UI - Pick your screens, drag (or type) the exact area to mirr
 
 ## Just want to use it?
 
-👉 **Open the [`cpp`](cpp) folder and follow its README.**
+👉 **[Download the latest `mirror.exe`](https://github.com/finaea/monitor-mirror/releases/latest/download/mirror.exe)** (or browse [all releases](https://github.com/finaea/monitor-mirror/releases)).
 
-That is the app to run. It's a single small `mirror.exe`, and the first time you
-start it the setup window walks you through everything. No installation, no
-technical steps.
+That's the whole app — a single small file, no installer. Double-click it; the
+first time, a setup window walks you through picking your screens and the area to
+mirror. See the [`cpp`](cpp) README for full usage.
 
 ## What's in this project
 

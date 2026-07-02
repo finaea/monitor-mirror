@@ -1,7 +1,6 @@
 # Monitor Mirror — how to use it
 
-This app shows a live copy of part of one screen on another screen, with almost
-no delay. You set it up once in a simple window; after that it runs quietly in
+You set it up once in a simple window; after that it runs quietly in
 the system tray (the little icons near the clock).
 
 No installation. It's a single file: **`mirror.exe`**.
@@ -11,9 +10,14 @@ No installation. It's a single file: **`mirror.exe`**.
 
 ---
 
-## 1. Start it
+## 1. Get it & start it
 
-Double-click **`mirror.exe`**.
+**[Download the latest `mirror.exe`](https://github.com/finaea/monitor-mirror/releases/latest/download/mirror.exe)**
+from the [Releases page](https://github.com/finaea/monitor-mirror/releases) — no
+installer, just the one file. (Windows SmartScreen may warn about an unknown
+publisher since the exe isn't code-signed; choose *More info → Run anyway*.)
+
+Then double-click **`mirror.exe`**.
 
 The **first time** (or any time it can't find its settings), a **Setup window**
 opens. You must set it up once before it will run — or you can load settings
