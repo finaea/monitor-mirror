@@ -753,8 +753,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
             }
         }
 
-        // rebuild after an edit-save or a display change (with fallback prompts)
-        if (g_reconfigure) {
+        // Rebuild after an edit-save or a display change. Only act (and only
+        // show the fallback prompt) while mirroring is ENABLED — if a monitor is
+        // unplugged while we're idle in the tray, we defer until the user turns
+        // mirroring back on, so no dialog pops up unprompted. (First-launch setup
+        // still runs before this loop.)
+        if (g_reconfigure && g_enabled) {
             g_reconfigure = false;
             if (!ensureConfigured(m, L"")) { g_running = false; break; }
         }

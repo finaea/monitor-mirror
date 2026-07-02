@@ -26,7 +26,7 @@ enum {
     ID_TGT_X = 120, ID_TGT_Y, ID_TGT_W, ID_TGT_H,
     ID_FPS = 130, ID_VSYNC, ID_CURSOR, ID_COVER,
     ID_ROT, ID_FLIPH, ID_FLIPV, ID_WINDOWED, ID_LOG,
-    ID_SAVE = 140, ID_IMPORT, ID_EXPORT, ID_QUIT
+    ID_SAVE = 140, ID_IMPORT, ID_EXPORT, ID_QUIT, ID_REFRESH
 };
 static const UINT WM_CANVAS_CHANGED = WM_APP + 20;   // wParam: 0=source, 1=target
 
@@ -350,7 +350,8 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
 
 // ---- dialog state ----------------------------------------------------------
 struct DlgState {
-    const std::vector<MonitorInfo>* mons = nullptr;
+    std::vector<MonitorInfo> monsStore;                 // owned; re-enumerated by Refresh
+    const std::vector<MonitorInfo>* mons = nullptr;     // -> &monsStore
     MirrorConfig* out = nullptr;
     std::wstring  defaultPath;
     ConfigResult  result = ConfigResult::Quit;
@@ -503,6 +504,27 @@ static bool configFromControls(DlgState* s, MirrorConfig& c){
     c.log      = SendMessageW(s->hLog,      BM_GETCHECK, 0, 0) == BST_CHECKED;
     c.rotation = dlgRotation(s);
     return true;
+}
+
+// Re-enumerate connected monitors (e.g. after plugging/unplugging a display) and
+// repopulate the pickers, keeping the current choices/areas where possible.
+static void refreshMonitors(DlgState* s){
+    MirrorConfig cur; bool have = configFromControls(s, cur);   // snapshot current choices
+    s->monsStore = EnumMonitors();
+    SendMessageW(s->hSrcCombo, CB_RESETCONTENT, 0, 0);
+    SendMessageW(s->hTgtCombo, CB_RESETCONTENT, 0, 0);
+    for (const auto& m : s->monsStore){
+        SendMessageW(s->hSrcCombo, CB_ADDSTRING, 0, (LPARAM)m.label().c_str());
+        SendMessageW(s->hTgtCombo, CB_ADDSTRING, 0, (LPARAM)m.label().c_str());
+    }
+    if (have) {
+        controlsFromConfig(s, cur);   // re-select by stable id/device, restore areas + options
+    } else {
+        s->src.mon = s->tgt.mon = nullptr;
+        setTargetEnabled(s, false);
+        InvalidateRect(s->src.hwnd, nullptr, FALSE);
+        InvalidateRect(s->tgt.hwnd, nullptr, FALSE);
+    }
 }
 
 // user typed in the source X/Y/W/H fields
@@ -731,13 +753,14 @@ static void createControls(HWND hwnd, DlgState* s, HINSTANCE hi, const std::wstr
 
     // ---- buttons ----
     int by = LO_BTN_Y, right = LO_CARD_BX + LO_CARD_W;
-    makeButton(hwnd, hi, ID_SAVE,   L"Save && Start",  LO_CARD_AX,       by, 168, 40);
-    makeButton(hwnd, hi, ID_IMPORT, L"Import…",        LO_CARD_AX + 180, by, 112, 40);
-    makeButton(hwnd, hi, ID_EXPORT, L"Export…",        LO_CARD_AX + 300, by, 112, 40);
-    makeButton(hwnd, hi, ID_QUIT,   L"Cancel && Quit", right - 150,      by, 150, 40);
+    makeButton(hwnd, hi, ID_SAVE,    L"Save && Start",    LO_CARD_AX,       by, 150, 40);
+    makeButton(hwnd, hi, ID_IMPORT,  L"Import…",          LO_CARD_AX + 162, by, 100, 40);
+    makeButton(hwnd, hi, ID_EXPORT,  L"Export…",          LO_CARD_AX + 270, by, 100, 40);
+    makeButton(hwnd, hi, ID_REFRESH, L"↻ Refresh monitors", LO_CARD_AX + 378, by, 184, 40);
+    makeButton(hwnd, hi, ID_QUIT,    L"Cancel && Quit",   right - 150,      by, 150, 40);
 
-    // subclass the four owner-drawn buttons for hover feedback
-    for (int id : { ID_SAVE, ID_IMPORT, ID_EXPORT, ID_QUIT })
+    // subclass the owner-drawn buttons for hover feedback
+    for (int id : { ID_SAVE, ID_IMPORT, ID_EXPORT, ID_REFRESH, ID_QUIT })
         SetWindowSubclass(GetDlgItem(hwnd, id), BtnSub, 1, (DWORD_PTR)s);
 }
 
@@ -846,6 +869,7 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             return 0;
         }
         if (code == BN_CLICKED){
+            if (id == ID_REFRESH){ refreshMonitors(s); return 0; }
             if (id == ID_QUIT){ s->result = ConfigResult::Quit; s->done = true; DestroyWindow(hwnd); return 0; }
             if (id == ID_SAVE){
                 MirrorConfig c;
@@ -939,7 +963,8 @@ ConfigResult RunConfigDialog(MirrorConfig& cfg,
     }
 
     DlgState st;
-    st.mons = &mons; st.out = &cfg; st.defaultPath = defaultPath;
+    st.monsStore = mons; st.mons = &st.monsStore;   // own the list so Refresh can update it
+    st.out = &cfg; st.defaultPath = defaultPath;
 
     // client must fit: header + banner + cards + options + buttons + margin
     int clientW = LO_CARD_BX + LO_CARD_W + LO_MARGIN;
