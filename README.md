@@ -23,7 +23,7 @@ capture card needed**.
 
 Can be use for other purposes such as OBS recording.
 
-(Note that this is just a mirroring tool, it does not transfer pen pressure data. You have to configure your tablet driver to map the same area as the main monitor working area, and then mirror that to your drawing tablet. It's a workaround method.)
+(Note that this is just a mirroring tool, it does not transfer pen pressure data. You have to configure your tablet driver to map the same area as the main working monitor area, and then mirror that to your drawing tablet. It's a workaround method. Alternatively, you can set your drawing tablet as main working monitor and then mirror this to your ultrawide monitor)
 
 ## Demo
 
