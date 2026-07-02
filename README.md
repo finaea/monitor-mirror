@@ -1,13 +1,64 @@
-# Monitor Mirror
+<p align="center">
+  <img src="docs/icon.png" width="96" alt="Monitor Mirror icon">
+</p>
 
-Show a live, low-lag copy of part of one monitor on another monitor.
+<h1 align="center">Monitor Mirror</h1>
 
-It was made for drawing on a pen display / tablet: you draw on your **main
-screen** (where the drawing app is), and an exact copy appears on a **second
-screen** — so someone watching, a stream, or a reference monitor sees exactly
-what you draw, with almost no delay.
+<p align="center">
+  A simple monitor display mirroring tool — draw on the tablet,
+  and see it live on your main monitor with almost no delay.
+</p>
 
 > **Windows 10 / 11 only** (64-bit). Not available for macOS or Linux.
+
+---
+
+## What it's for
+
+This was built intended for people who prefer an easy software solution to draw in hybrid with pen display tablet (e.g. a Huion / Wacom pen display) mirroring the main monitor for better ergonomic.
+
+Especially on an **ultrawide**: mirror just the slice you're working in onto
+another screen (or a floating window) at true 1:1 — **no picture-in-picture supported monitor or
+capture card needed**.
+
+Can be use for other purposes such as OBS recording.
+
+(Note that this is just a mirroring tool, it does not transfer pen pressure data. You have to configure your tablet driver to map the same area as the main monitor working area, and then mirror that to your drawing tablet. It's a workaround method.)
+
+## Demo
+
+![Monitor Mirror in action](preview.png)
+
+<video src="preview.mov" controls muted loop width="100%"></video>
+
+▶️ If the video doesn't play inline, open [`preview.mov`](preview.mov).
+
+## The setup window
+
+Quick configurable UI - Pick your screens, drag (or type) the exact area to mirror, and go.
+
+![Monitor Mirror setup window](docs/setup.png)
+
+## Key features
+
+- ⚡ **Ultra-low latency** — an all-GPU pipeline (DXGI Desktop Duplication → GPU
+  crop → flip-model present). Under ~1 ms of added work; no CPU round-trip, no
+  compositor frame. (Full breakdown in the [cpp README](cpp/README.md#how-fast-is-it-and-how-does-it-work).)
+- 🖥️ **Visual setup** — pick the working monitor and the mirror monitor, drag a
+  box or type exact pixels; the mirror area is **ratio-locked**.
+- 🪟 **Floating-window mode** — mirror into a movable, resizable window that can
+  share the **same** screen — no second monitor needed, and easy to capture in OBS.
+- 🔄 **Rotation & flip** — 90° / 180° / 270° plus horizontal/vertical flip, for
+  tablets mounted sideways or upside-down.
+- 🎚️ **Tuning** — FPS cap, V-Sync, cursor on/off, and a black-out-background toggle.
+- 🧷 **Robust config** — monitors are remembered by a **stable hardware id** (not
+  just `\\.\DISPLAYx`), so re-plugging that renumbers displays won't break it.
+  Import/export your settings as a `.cfg`.
+- 🛟 **Self-healing** — on a display change, unplug, or bad config it re-opens the
+  setup window and tells you exactly what's wrong. Optional `mirror.log` for
+  diagnostics.
+- 📌 **Lives in the tray** — left-click to toggle, right-click to edit or quit;
+  uses zero resources when disabled.
 
 ---
 
@@ -16,17 +67,15 @@ what you draw, with almost no delay.
 👉 **Open the [`cpp`](cpp) folder and follow its README.**
 
 That is the app to run. It's a single small `mirror.exe`, and the first time you
-start it, a setup window walks you through picking your screens and the area to
-mirror. No installation, no technical steps.
-
----
+start it the setup window walks you through everything. No installation, no
+technical steps.
 
 ## What's in this project
 
 | Folder | What it is |
 |---|---|
 | [`cpp/`](cpp) | **The app you should use.** Tiny, fastest, set up with a visual window. |
-| [`python/`](python) | An **older version kept for reference/archival**. Same idea, but the settings are edited in code instead of a window. |
+| [`python/`](python) | An **older version kept for reference/archival**. Same idea, but settings are edited in code instead of a window. |
 
 A detailed side-by-side of the two versions lives in
 [`python/build_compare.md`](python/build_compare.md).
