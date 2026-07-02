@@ -368,6 +368,9 @@ struct DlgState {
 
 static void setInt(HWND e, int v){ wchar_t b[16]; swprintf(b,16,L"%d",v); SetWindowTextW(e,b); }
 static int  getInt(HWND e){ wchar_t b[16]={0}; GetWindowTextW(e,b,16); return _wtoi(b); }
+// Like setInt, but never rewrites the control the user is typing in — SetWindowText
+// resets the caret to the start, which would reverse what's being typed.
+static void setIntF(HWND e, int v){ if (e == GetFocus()) return; setInt(e, v); }
 
 // rotation currently selected in the dialog (degrees), and the resulting
 // aspect the target box must have (rotation by 90/270 swaps w/h).
@@ -386,18 +389,18 @@ static double dlgEffAspect(DlgState* s){
 
 static void writeSrcFields(DlgState* s){
     s->syncing = true;
-    setInt(s->hSrcX, s->src.region.left);
-    setInt(s->hSrcY, s->src.region.top);
-    setInt(s->hSrcW, s->src.region.right - s->src.region.left);
-    setInt(s->hSrcH, s->src.region.bottom - s->src.region.top);
+    setIntF(s->hSrcX, s->src.region.left);
+    setIntF(s->hSrcY, s->src.region.top);
+    setIntF(s->hSrcW, s->src.region.right - s->src.region.left);
+    setIntF(s->hSrcH, s->src.region.bottom - s->src.region.top);
     s->syncing = false;
 }
 static void writeTgtFields(DlgState* s){
     s->syncing = true;
-    setInt(s->hTgtX, s->tgt.region.left);
-    setInt(s->hTgtY, s->tgt.region.top);
-    setInt(s->hTgtW, s->tgt.region.right - s->tgt.region.left);
-    setInt(s->hTgtH, s->tgt.region.bottom - s->tgt.region.top);
+    setIntF(s->hTgtX, s->tgt.region.left);
+    setIntF(s->hTgtY, s->tgt.region.top);
+    setIntF(s->hTgtW, s->tgt.region.right - s->tgt.region.left);
+    setIntF(s->hTgtH, s->tgt.region.bottom - s->tgt.region.top);
     s->syncing = false;
 }
 
@@ -835,6 +838,11 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         if (code == EN_CHANGE && !s->syncing){
             if (id==ID_SRC_X||id==ID_SRC_Y||id==ID_SRC_W||id==ID_SRC_H){ srcFieldsToCanvas(s); writeSrcFields(s); }
             else if (id==ID_TGT_X||id==ID_TGT_Y||id==ID_TGT_W)         { tgtFieldsToCanvas(s); }
+            return 0;
+        }
+        if (code == EN_KILLFOCUS){   // field lost focus: show the actual (clamped) value
+            if (id==ID_SRC_X||id==ID_SRC_Y||id==ID_SRC_W||id==ID_SRC_H) writeSrcFields(s);
+            else if (id==ID_TGT_X||id==ID_TGT_Y||id==ID_TGT_W)          writeTgtFields(s);
             return 0;
         }
         if (code == BN_CLICKED){
