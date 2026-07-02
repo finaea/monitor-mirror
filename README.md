@@ -27,11 +27,11 @@ Can be use for other purposes such as OBS recording.
 
 ## Demo
 
-![Monitor Mirror in action](preview.png)
+Drawing on the pen display (right) shows live on the main monitor (left):
 
-<video src="preview.mov" controls muted loop width="100%"></video>
+![Monitor Mirror in action](docs/preview.gif)
 
-▶️ If the video doesn't play inline, open [`preview.mov`](preview.mov).
+▶️ [Watch the full-quality video](preview.mov) (sharper, original speed).
 
 ## The setup window
 
