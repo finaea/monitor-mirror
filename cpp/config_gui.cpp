@@ -29,6 +29,10 @@ enum {
 };
 static const UINT WM_CANVAS_CHANGED = WM_APP + 20;   // wParam: 0=source, 1=target
 
+// shared fonts / brushes (created in RunConfigDialog)
+static HFONT  g_font = nullptr, g_hdrFont = nullptr, g_titleFont = nullptr, g_subFont = nullptr, g_btnFont = nullptr;
+static HBRUSH g_bgBrush = nullptr, g_cardBrush = nullptr;
+
 // ---- a monitor-with-a-box canvas -------------------------------------------
 struct Canvas {
     HWND hwnd = nullptr, parent = nullptr;
@@ -47,6 +51,8 @@ struct Canvas {
 
 static double clampd(double v, double lo, double hi){ return v < lo ? lo : (v > hi ? hi : v); }
 static int    clampi(int v, int lo, int hi){ return v < lo ? lo : (v > hi ? hi : v); }
+static void   fillRound(HDC dc, RECT r, int rad, COLORREF fill);     // defined below
+static void   strokeRound(HDC dc, RECT r, int rad, COLORREF line);
 
 static void computeView(Canvas* c) {
     RECT cr; GetClientRect(c->hwnd, &cr);
@@ -189,48 +195,52 @@ static void paintCanvas(Canvas* c){
     HBITMAP bmp = CreateCompatibleBitmap(dc, cr.right, cr.bottom);
     HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
 
-    HBRUSH bg = CreateSolidBrush(RGB(252,252,253)); FillRect(mem, &cr, bg); DeleteObject(bg);
-    HBRUSH border = CreateSolidBrush(RGB(206,211,219)); FrameRect(mem, &cr, border); DeleteObject(border);
+    HBRUSH bg = CreateSolidBrush(RGB(255,255,255)); FillRect(mem, &cr, bg); DeleteObject(bg);
 
     if (c->mon){
         computeView(c);
-        // monitor body
+        SetBkMode(mem, TRANSPARENT);
+
+        // monitor body (rounded dark panel)
         POINT a = m2c(c, 0, 0), b = m2c(c, c->mon->w(), c->mon->h());
         RECT mr = { a.x, a.y, b.x, b.y };
-        HBRUSH mb = CreateSolidBrush(RGB(40,44,52)); FillRect(mem, &mr, mb); DeleteObject(mb);
-        FrameRect(mem, &mr, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        fillRound(mem, mr, 8, RGB(37, 42, 53));
+        strokeRound(mem, mr, 8, RGB(22, 26, 34));
 
-        // region
+        const COLORREF regFill = c->ratioLocked ? RGB(36, 168, 124) : RGB(70, 130, 232);
+        const COLORREF regEdge = c->ratioLocked ? RGB(120, 226, 186) : RGB(150, 190, 255);
+
+        // region rectangle
         POINT ra = m2c(c, c->region.left, c->region.top);
         POINT rb = m2c(c, c->region.right, c->region.bottom);
         RECT rr = { ra.x, ra.y, rb.x, rb.y };
-        COLORREF fill = c->ratioLocked ? RGB(46,120,90) : RGB(53,110,214);
-        HBRUSH rb2 = CreateSolidBrush(fill); FillRect(mem, &rr, rb2); DeleteObject(rb2);
-        HPEN pen = CreatePen(PS_SOLID, 1, RGB(120,200,255));
-        HPEN op = (HPEN)SelectObject(mem, pen);
-        HBRUSH ob = (HBRUSH)SelectObject(mem, GetStockObject(NULL_BRUSH));
-        Rectangle(mem, rr.left, rr.top, rr.right, rr.bottom);
+        fillRound(mem, rr, 4, regFill);
+        HPEN pen = CreatePen(PS_SOLID, 2, regEdge);
+        HGDIOBJ op = SelectObject(mem, pen), ob = SelectObject(mem, GetStockObject(NULL_BRUSH));
+        RoundRect(mem, rr.left, rr.top, rr.right, rr.bottom, 4, 4);
         SelectObject(mem, ob); SelectObject(mem, op); DeleteObject(pen);
 
-        // handles
+        // dimension text centred in the region
+        wchar_t txt[64];
+        swprintf(txt, 64, L"%d × %d", c->region.right - c->region.left, c->region.bottom - c->region.top);
+        SetTextColor(mem, RGB(255, 255, 255));
+        SelectObject(mem, g_subFont ? g_subFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+        DrawTextW(mem, txt, -1, &rr, DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOCLIP);
+
+        // handles as circles (white fill, coloured ring)
         POINT hp[8]; handlePoints(c->region, hp);
-        HBRUSH hb = CreateSolidBrush(RGB(255,255,255));
+        HPEN hpen = CreatePen(PS_SOLID, 2, regEdge);
+        HBRUSH hbr = CreateSolidBrush(RGB(255, 255, 255));
+        HGDIOBJ op2 = SelectObject(mem, hpen), ob2 = SelectObject(mem, hbr);
         for (int i = 0; i < 8; ++i){
             if (c->ratioLocked && !isCorner(i)) continue;
             POINT p = m2c(c, hp[i].x, hp[i].y);
-            RECT h = { p.x-4, p.y-4, p.x+4, p.y+4 };
-            FillRect(mem, &h, hb); FrameRect(mem, &h, (HBRUSH)GetStockObject(BLACK_BRUSH));
+            Ellipse(mem, p.x - 5, p.y - 5, p.x + 5, p.y + 5);
         }
-        DeleteObject(hb);
-
-        // size label
-        wchar_t txt[64];
-        swprintf(txt, 64, L"%d x %d px", c->region.right-c->region.left, c->region.bottom-c->region.top);
-        SetBkMode(mem, TRANSPARENT); SetTextColor(mem, RGB(230,230,230));
-        RECT tr = { mr.left+4, mr.top+3, mr.right, mr.top+22 };
-        DrawTextW(mem, txt, -1, &tr, DT_LEFT|DT_TOP|DT_SINGLELINE);
+        SelectObject(mem, ob2); SelectObject(mem, op2); DeleteObject(hpen); DeleteObject(hbr);
     } else {
-        SetBkMode(mem, TRANSPARENT); SetTextColor(mem, RGB(140,145,154));
+        SetBkMode(mem, TRANSPARENT); SetTextColor(mem, RGB(150,155,164));
+        SelectObject(mem, g_font ? g_font : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
         LPCWSTR hint = c->enabled ? L"Select a monitor above."
                                   : L"Select the main working monitor first.";
         DrawTextW(mem, hint, -1, &cr, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
@@ -294,7 +304,9 @@ struct DlgState {
     HWND hSrcCombo=0, hTgtCombo=0;
     HWND hSrcX=0,hSrcY=0,hSrcW=0,hSrcH=0;
     HWND hTgtX=0,hTgtY=0,hTgtW=0,hTgtH=0;
-    HWND hFps=0, hVsync=0, hCursor=0, hCover=0, hBanner=0;
+    HWND hFps=0, hVsync=0, hCursor=0, hCover=0;
+    HWND hover=nullptr;          // button currently hovered (for owner-draw)
+    std::wstring banner;         // info/error strip text (painted, not a control)
 };
 
 static void setInt(HWND e, int v){ wchar_t b[16]; swprintf(b,16,L"%d",v); SetWindowTextW(e,b); }
@@ -454,16 +466,40 @@ static bool browseFile(HWND owner, const std::wstring& startDir, bool save, std:
     out = file; return true;
 }
 
-static HFONT  g_font = nullptr, g_hdrFont = nullptr, g_titleFont = nullptr;
-static HBRUSH g_bgBrush = nullptr, g_bannerBrush = nullptr;
-static const COLORREF CLR_BG        = RGB(247, 248, 250);
-static const COLORREF CLR_TEXT      = RGB(32, 36, 44);
-static const COLORREF CLR_SUB       = RGB(110, 116, 126);
+static const COLORREF CLR_BG        = RGB(242, 244, 248);
+static const COLORREF CLR_CARD      = RGB(255, 255, 255);
+static const COLORREF CLR_CARD_LINE = RGB(220, 224, 231);
+static const COLORREF CLR_SHADOW    = RGB(228, 231, 237);
+static const COLORREF CLR_TEXT      = RGB(30, 34, 42);
+static const COLORREF CLR_SUB       = RGB(112, 118, 130);
+static const COLORREF CLR_ACCENT    = RGB(43, 104, 218);
+static const COLORREF CLR_ACCENT_HI = RGB(58, 122, 240);
+static const COLORREF CLR_ACCENT_LO = RGB(32, 84, 186);
+static const COLORREF CLR_HDRTX     = RGB(255, 255, 255);
+static const COLORREF CLR_HDRSUB    = RGB(200, 216, 248);
 static const COLORREF CLR_BANNER_BG = RGB(255, 246, 209);   // soft amber info strip
+static const COLORREF CLR_BANNER_LN = RGB(240, 214, 140);
 static const COLORREF CLR_BANNER_TX = RGB(122, 82, 8);
+static const COLORREF CLR_DANGER    = RGB(197, 58, 58);
+static const COLORREF CLR_DANGER_HI = RGB(253, 240, 240);
+
+// ---- layout constants (shared by createControls and WM_PAINT) --------------
+enum {
+    LO_HDR_H = 60, LO_MARGIN = 16, LO_CARD_W = 448, LO_GAP = 12,
+    LO_CARD_AX = LO_MARGIN,
+    LO_CARD_BX = LO_MARGIN + LO_CARD_W + LO_GAP,
+    LO_BANNER_Y = LO_HDR_H + 12, LO_BANNER_H = 44,
+    LO_CARD_Y = LO_BANNER_Y + LO_BANNER_H + 12,
+    LO_CARD_H = 312,
+    LO_PAD = 16,
+    LO_OPT_Y = LO_CARD_Y + LO_CARD_H + 16,
+    LO_BTN_Y = LO_OPT_Y + 44 + 14
+};
 
 static HWND makeLabel(HWND p, HINSTANCE hi, LPCWSTR t, int x, int y, int w, int h, HFONT f = nullptr){
-    HWND c = CreateWindowExW(0, L"STATIC", t, WS_CHILD|WS_VISIBLE, x,y,w,h, p, nullptr, hi, nullptr);
+    // SS_CENTERIMAGE centres text vertically so descenders (g, p, y) are never clipped.
+    HWND c = CreateWindowExW(0, L"STATIC", t, WS_CHILD|WS_VISIBLE|SS_LEFT|SS_CENTERIMAGE,
+                             x,y,w,h, p, nullptr, hi, nullptr);
     SendMessageW(c, WM_SETFONT, (WPARAM)(f ? f : g_font), TRUE); return c;
 }
 static HWND makeEdit(HWND p, HINSTANCE hi, int id, int x, int y, int w, int h){
@@ -471,10 +507,10 @@ static HWND makeEdit(HWND p, HINSTANCE hi, int id, int x, int y, int w, int h){
                              x,y,w,h, p, (HMENU)(INT_PTR)id, hi, nullptr);
     SendMessageW(c, WM_SETFONT, (WPARAM)g_font, TRUE); return c;
 }
-static HWND makeButton(HWND p, HINSTANCE hi, int id, LPCWSTR t, int x, int y, int w, int h, bool def = false){
-    HWND c = CreateWindowExW(0, L"BUTTON", t, WS_CHILD|WS_VISIBLE|(def ? BS_DEFPUSHBUTTON : BS_PUSHBUTTON),
+static HWND makeButton(HWND p, HINSTANCE hi, int id, LPCWSTR t, int x, int y, int w, int h){
+    HWND c = CreateWindowExW(0, L"BUTTON", t, WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
                              x,y,w,h, p, (HMENU)(INT_PTR)id, hi, nullptr);
-    SendMessageW(c, WM_SETFONT, (WPARAM)g_font, TRUE); return c;
+    SendMessageW(c, WM_SETFONT, (WPARAM)(g_btnFont ? g_btnFont : g_font), TRUE); return c;
 }
 static HWND makeCheck(HWND p, HINSTANCE hi, int id, LPCWSTR t, int x, int y, int w, int h){
     HWND c = CreateWindowExW(0, L"BUTTON", t, WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
@@ -482,99 +518,188 @@ static HWND makeCheck(HWND p, HINSTANCE hi, int id, LPCWSTR t, int x, int y, int
     SendMessageW(c, WM_SETFONT, (WPARAM)g_font, TRUE); return c;
 }
 
+// ---- GDI paint helpers -----------------------------------------------------
+static void fillRound(HDC dc, RECT r, int rad, COLORREF fill){
+    HBRUSH b = CreateSolidBrush(fill); HPEN pn = CreatePen(PS_SOLID, 1, fill);
+    HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, pn);
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
+    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b); DeleteObject(pn);
+}
+static void strokeRound(HDC dc, RECT r, int rad, COLORREF line){
+    HPEN pn = CreatePen(PS_SOLID, 1, line); HGDIOBJ op = SelectObject(dc, pn);
+    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
+    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(pn);
+}
+static void drawCard(HDC dc, int x, int y, int w, int h){
+    RECT sh = { x, y + 2, x + w + 2, y + h + 2 }; fillRound(dc, sh, 14, CLR_SHADOW);  // soft shadow
+    RECT c  = { x, y, x + w, y + h };            fillRound(dc, c, 14, CLR_CARD);
+    strokeRound(dc, c, 14, CLR_CARD_LINE);
+}
+
+// hover tracking for owner-drawn buttons
+static LRESULT CALLBACK BtnSub(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR ref){
+    DlgState* s = (DlgState*)ref;
+    if (m == WM_MOUSEMOVE){
+        if (s && s->hover != h){
+            s->hover = h; InvalidateRect(h, nullptr, TRUE);
+            TRACKMOUSEEVENT t = { sizeof(t), TME_LEAVE, h, 0 }; TrackMouseEvent(&t);
+        }
+    } else if (m == WM_MOUSELEAVE){
+        if (s && s->hover == h){ s->hover = nullptr; InvalidateRect(h, nullptr, TRUE); }
+    }
+    return DefSubclassProc(h, m, w, l);
+}
+static void drawButton(DRAWITEMSTRUCT* di, DlgState* s){
+    HDC dc = di->hDC; RECT r = di->rcItem;
+    bool down = (di->itemState & ODS_SELECTED) != 0;
+    bool hot  = s && s->hover == di->hwndItem;
+    bool primary = (int)di->CtlID == ID_SAVE, danger = (int)di->CtlID == ID_QUIT;
+    COLORREF fill, line, tx;
+    if (primary){ fill = down ? CLR_ACCENT_LO : (hot ? CLR_ACCENT_HI : CLR_ACCENT); line = fill; tx = RGB(255,255,255); }
+    else if (danger){ fill = down ? RGB(246,224,224) : (hot ? CLR_DANGER_HI : CLR_CARD); line = CLR_DANGER; tx = CLR_DANGER; }
+    else { fill = down ? RGB(230,235,242) : (hot ? RGB(244,247,251) : CLR_CARD); line = CLR_CARD_LINE; tx = CLR_TEXT; }
+
+    HBRUSH bg = CreateSolidBrush(CLR_BG); FillRect(dc, &r, bg); DeleteObject(bg);   // clear rounded corners
+    fillRound(dc, r, 9, fill); strokeRound(dc, r, 9, line);
+
+    wchar_t txt[80] = {0}; GetWindowTextW(di->hwndItem, txt, 80);
+    SetBkMode(dc, TRANSPARENT); SetTextColor(dc, tx);
+    HGDIOBJ of = SelectObject(dc, g_btnFont ? g_btnFont : g_font);
+    DrawTextW(dc, txt, -1, &r, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    SelectObject(dc, of);
+}
+
 static void createControls(HWND hwnd, DlgState* s, HINSTANCE hi, const std::wstring& banner){
     const auto& mons = *s->mons;
-    const int L = 18, R = 470;                 // left / right column x
-    const int COLW = 434;                      // column width
-    const int fx = L + 312, tx = R + 312, fw = 110;   // numeric-field x + width
+    s->banner = banner;
 
-    // ---- title ----
-    makeLabel(hwnd, hi, L"Display Mirror — Setup", L, 12, 500, 32, g_titleFont);
+    // Card A (source) / Card B (target) inner geometry
+    const int ax = LO_CARD_AX + LO_PAD, bx = LO_CARD_BX + LO_PAD;
+    const int innerW = LO_CARD_W - LO_PAD * 2;                 // usable width inside a card
+    const int canvasW = 200, gap = 32;                         // wide gap so fields never crowd the box
+    const int fw = innerW - canvasW - gap;                     // numeric-field column width
+    const int afx = ax + canvasW + gap, bfx = bx + canvasW + gap;
+    const int y0 = LO_CARD_Y;                                  // card top
 
-    // ---- banner / info strip ----
-    s->hBanner = makeLabel(hwnd, hi, banner.c_str(), L, 50, COLW*2 + (R-L-COLW), 40);
+    auto column = [&](int cardX, int cx, int fx, int hdrNum, LPCWSTR title, LPCWSTR hint,
+                      HWND& combo, int comboId, Canvas& cv,
+                      HWND& eX, HWND& eY, HWND& eW, HWND& eH, int idX, int idY, int idW, int idH,
+                      bool tgt){
+        makeLabel(hwnd, hi, title, cx, y0 + 14, LO_CARD_W - LO_PAD*2, 24, g_hdrFont);
+        makeLabel(hwnd, hi, hint,  cx, y0 + 40, LO_CARD_W - LO_PAD*2, 20, g_subFont);
+        combo = CreateWindowExW(0, L"COMBOBOX", L"",
+            WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL, cx, y0 + 64, innerW, 300,
+            hwnd, (HMENU)(INT_PTR)comboId, hi, nullptr);
+        SendMessageW(combo, WM_SETFONT, (WPARAM)g_font, TRUE);
 
-    // ---- section 1 : source ----
-    makeLabel(hwnd, hi, L"1  ·  Main working monitor", L, 100, COLW, 22, g_hdrFont);
-    makeLabel(hwnd, hi, L"Where your drawing app runs. Drag the box, or type the exact area.",
-              L, 124, COLW, 16);
-    s->hSrcCombo = CreateWindowExW(0, L"COMBOBOX", L"",
-        WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL, L, 146, COLW, 300,
-        hwnd, (HMENU)ID_SRC_COMBO, hi, nullptr);
-    SendMessageW(s->hSrcCombo, WM_SETFONT, (WPARAM)g_font, TRUE);
+        int cvY = y0 + 100, cvH = 196;
+        cv.hwnd = CreateWindowExW(0, L"MirrorCfgCanvas", L"", WS_CHILD|WS_VISIBLE,
+                                  cx, cvY, canvasW, cvH, hwnd, nullptr, hi, nullptr);
+        cv.parent = hwnd; cv.which = tgt ? 1 : 0; cv.ratioLocked = tgt;
+        SetWindowLongPtrW(cv.hwnd, GWLP_USERDATA, (LONG_PTR)&cv);
 
-    // ---- section 2 : target ----
-    makeLabel(hwnd, hi, L"2  ·  Mirror onto monitor", R, 100, COLW, 22, g_hdrFont);
-    makeLabel(hwnd, hi, L"Kept locked to the same shape. Drag to place, drag a corner to resize.",
-              R, 124, COLW, 16);
-    s->hTgtCombo = CreateWindowExW(0, L"COMBOBOX", L"",
-        WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL, R, 146, COLW, 300,
-        hwnd, (HMENU)ID_TGT_COMBO, hi, nullptr);
-    SendMessageW(s->hTgtCombo, WM_SETFONT, (WPARAM)g_font, TRUE);
+        // each row: label, then its edit 21px lower (clear gap), rows 49px apart
+        int r0 = cvY, rh = 49, lo = 22;
+        makeLabel(hwnd, hi, L"X  (px)", fx, r0,        fw, 20); eX = makeEdit(hwnd, hi, idX, fx, r0+lo,        fw, 24);
+        makeLabel(hwnd, hi, L"Y  (px)", fx, r0+rh,     fw, 20); eY = makeEdit(hwnd, hi, idY, fx, r0+rh+lo,     fw, 24);
+        makeLabel(hwnd, hi, L"Width",   fx, r0+rh*2,   fw, 20); eW = makeEdit(hwnd, hi, idW, fx, r0+rh*2+lo,   fw, 24);
+        makeLabel(hwnd, hi, tgt ? L"Height (auto)" : L"Height",
+                  fx, r0+rh*3,   fw, 20); eH = makeEdit(hwnd, hi, idH, fx, r0+rh*3+lo,   fw, 24);
+    };
+
+    column(LO_CARD_AX, ax, afx, 1,
+           L"1  ·  Main working monitor",
+           L"Where your drawing app runs — drag the box or type the area.",
+           s->hSrcCombo, ID_SRC_COMBO, s->src,
+           s->hSrcX, s->hSrcY, s->hSrcW, s->hSrcH, ID_SRC_X, ID_SRC_Y, ID_SRC_W, ID_SRC_H, false);
+    column(LO_CARD_BX, bx, bfx, 2,
+           L"2  ·  Mirror onto monitor",
+           L"Locked to the same shape — drag to place, drag a corner to resize.",
+           s->hTgtCombo, ID_TGT_COMBO, s->tgt,
+           s->hTgtX, s->hTgtY, s->hTgtW, s->hTgtH, ID_TGT_X, ID_TGT_Y, ID_TGT_W, ID_TGT_H, true);
+
+    EnableWindow(s->hTgtH, FALSE);   // derived from the locked ratio
 
     for (const auto& m : mons){
         SendMessageW(s->hSrcCombo, CB_ADDSTRING, 0, (LPARAM)m.label().c_str());
         SendMessageW(s->hTgtCombo, CB_ADDSTRING, 0, (LPARAM)m.label().c_str());
     }
 
-    // canvases (borderless; each paints its own card + border)
-    s->src.hwnd = CreateWindowExW(0, L"MirrorCfgCanvas", L"",
-        WS_CHILD|WS_VISIBLE, L, 182, 300, 196, hwnd, nullptr, hi, nullptr);
-    s->tgt.hwnd = CreateWindowExW(0, L"MirrorCfgCanvas", L"",
-        WS_CHILD|WS_VISIBLE, R, 182, 300, 196, hwnd, nullptr, hi, nullptr);
-    s->src.parent = s->tgt.parent = hwnd;
-    s->src.which = 0; s->tgt.which = 1;
-    s->tgt.ratioLocked = true;
-    SetWindowLongPtrW(s->src.hwnd, GWLP_USERDATA, (LONG_PTR)&s->src);
-    SetWindowLongPtrW(s->tgt.hwnd, GWLP_USERDATA, (LONG_PTR)&s->tgt);
-
-    // numeric fields (right of each canvas)
-    makeLabel(hwnd, hi, L"X  (px)", fx, 182, fw, 16); s->hSrcX = makeEdit(hwnd, hi, ID_SRC_X, fx, 200, fw, 24);
-    makeLabel(hwnd, hi, L"Y  (px)", fx, 230, fw, 16); s->hSrcY = makeEdit(hwnd, hi, ID_SRC_Y, fx, 248, fw, 24);
-    makeLabel(hwnd, hi, L"Width",  fx, 278, fw, 16);  s->hSrcW = makeEdit(hwnd, hi, ID_SRC_W, fx, 296, fw, 24);
-    makeLabel(hwnd, hi, L"Height", fx, 326, fw, 16);  s->hSrcH = makeEdit(hwnd, hi, ID_SRC_H, fx, 344, fw, 24);
-
-    makeLabel(hwnd, hi, L"X  (px)", tx, 182, fw, 16); s->hTgtX = makeEdit(hwnd, hi, ID_TGT_X, tx, 200, fw, 24);
-    makeLabel(hwnd, hi, L"Y  (px)", tx, 230, fw, 16); s->hTgtY = makeEdit(hwnd, hi, ID_TGT_Y, tx, 248, fw, 24);
-    makeLabel(hwnd, hi, L"Width",  tx, 278, fw, 16);  s->hTgtW = makeEdit(hwnd, hi, ID_TGT_W, tx, 296, fw, 24);
-    makeLabel(hwnd, hi, L"Height (auto)", tx, 326, fw, 16);
-    s->hTgtH = makeEdit(hwnd, hi, ID_TGT_H, tx, 344, fw, 24);
-    EnableWindow(s->hTgtH, FALSE);   // derived from the locked ratio
-
-    // ---- options row ----
-    int oy = 392;
-    makeLabel(hwnd, hi, L"Frame rate (FPS)", L, oy + 4, 120, 18);
-    s->hFps    = makeEdit (hwnd, hi, ID_FPS, L + 122, oy, 56, 24);
-    makeLabel(hwnd, hi, L"0 = uncapped", L + 184, oy + 4, 96, 18);
-    s->hVsync  = makeCheck(hwnd, hi, ID_VSYNC,  L"V-Sync",           L + 292, oy + 2, 90,  22);
-    s->hCursor = makeCheck(hwnd, hi, ID_CURSOR, L"Show cursor",      L + 388, oy + 2, 130, 22);
-    s->hCover  = makeCheck(hwnd, hi, ID_COVER,  L"Black background", L + 524, oy + 2, 170, 22);
+    // ---- options row (on its own full-width card) ----
+    int ox = LO_CARD_AX + LO_PAD, oy = LO_OPT_Y + 12;
+    makeLabel(hwnd, hi, L"Frame rate (FPS)", ox, oy + 2, 118, 22);
+    s->hFps    = makeEdit (hwnd, hi, ID_FPS, ox + 120, oy, 56, 24);
+    makeLabel(hwnd, hi, L"0 = uncapped", ox + 182, oy + 2, 96, 22);
+    s->hVsync  = makeCheck(hwnd, hi, ID_VSYNC,  L"V-Sync",           ox + 300, oy + 2, 88,  22);
+    s->hCursor = makeCheck(hwnd, hi, ID_CURSOR, L"Show cursor",      ox + 396, oy + 2, 128, 22);
+    s->hCover  = makeCheck(hwnd, hi, ID_COVER,  L"Black background", ox + 540, oy + 2, 180, 22);
 
     // ---- buttons ----
-    int by = 432;
-    makeButton(hwnd, hi, ID_SAVE,   L"Save && Start",  L,       by, 160, 36, true);
-    makeButton(hwnd, hi, ID_IMPORT, L"Import…",   L + 170, by, 110, 36);
-    makeButton(hwnd, hi, ID_EXPORT, L"Export…",   L + 288, by, 110, 36);
-    makeButton(hwnd, hi, ID_QUIT,   L"Cancel && Quit", R + 320, by, 132, 36);
+    int by = LO_BTN_Y, right = LO_CARD_BX + LO_CARD_W;
+    makeButton(hwnd, hi, ID_SAVE,   L"Save && Start",  LO_CARD_AX,       by, 168, 40);
+    makeButton(hwnd, hi, ID_IMPORT, L"Import…",        LO_CARD_AX + 180, by, 112, 40);
+    makeButton(hwnd, hi, ID_EXPORT, L"Export…",        LO_CARD_AX + 300, by, 112, 40);
+    makeButton(hwnd, hi, ID_QUIT,   L"Cancel && Quit", right - 150,      by, 150, 40);
+
+    // subclass the four owner-drawn buttons for hover feedback
+    for (int id : { ID_SAVE, ID_IMPORT, ID_EXPORT, ID_QUIT })
+        SetWindowSubclass(GetDlgItem(hwnd, id), BtnSub, 1, (DWORD_PTR)s);
 }
 
 static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     DlgState* s = (DlgState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     switch (msg){
-    case WM_CTLCOLORSTATIC: {
-        HDC dc = (HDC)wp;
-        SetBkMode(dc, OPAQUE);
-        if (s && (HWND)lp == s->hBanner){
-            SetTextColor(dc, CLR_BANNER_TX); SetBkColor(dc, CLR_BANNER_BG);
-            return (LRESULT)g_bannerBrush;
+    case WM_ERASEBKGND: return 1;   // painted fully in WM_PAINT (no flicker)
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(hwnd, &ps);
+        RECT cr; GetClientRect(hwnd, &cr);
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, cr.right, cr.bottom);
+        HGDIOBJ ob = SelectObject(mem, bmp);
+
+        HBRUSH bg = CreateSolidBrush(CLR_BG); FillRect(mem, &cr, bg); DeleteObject(bg);
+
+        // header band
+        RECT hb = { 0, 0, cr.right, LO_HDR_H };
+        HBRUSH ab = CreateSolidBrush(CLR_ACCENT); FillRect(mem, &hb, ab); DeleteObject(ab);
+        SetBkMode(mem, TRANSPARENT);
+        SelectObject(mem, g_titleFont); SetTextColor(mem, CLR_HDRTX);
+        RECT tr = { LO_MARGIN + 6, 9, cr.right - 16, 41 };
+        DrawTextW(mem, L"Display Mirror", -1, &tr, DT_LEFT|DT_SINGLELINE);
+        SelectObject(mem, g_subFont); SetTextColor(mem, CLR_HDRSUB);
+        RECT sr = { LO_MARGIN + 6, 37, cr.right - 16, 56 };
+        DrawTextW(mem, L"Choose what to mirror and where it appears.", -1, &sr, DT_LEFT|DT_SINGLELINE);
+
+        // info / error banner
+        if (s && !s->banner.empty()){
+            RECT br = { LO_MARGIN, LO_BANNER_Y, cr.right - LO_MARGIN, LO_BANNER_Y + LO_BANNER_H };
+            fillRound(mem, br, 10, CLR_BANNER_BG); strokeRound(mem, br, 10, CLR_BANNER_LN);
+            SelectObject(mem, g_font); SetTextColor(mem, CLR_BANNER_TX);
+            RECT bt = br; bt.left += 14; bt.right -= 14; bt.top += 5;
+            DrawTextW(mem, s->banner.c_str(), -1, &bt, DT_LEFT|DT_WORDBREAK);
         }
-        SetTextColor(dc, CLR_TEXT); SetBkColor(dc, CLR_BG);
-        return (LRESULT)g_bgBrush;
+
+        // cards
+        drawCard(mem, LO_CARD_AX, LO_CARD_Y, LO_CARD_W, LO_CARD_H);
+        drawCard(mem, LO_CARD_BX, LO_CARD_Y, LO_CARD_W, LO_CARD_H);
+        drawCard(mem, LO_CARD_AX, LO_OPT_Y, LO_CARD_BX + LO_CARD_W - LO_CARD_AX, 44);
+
+        BitBlt(dc, 0, 0, cr.right, cr.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, ob); DeleteObject(bmp); DeleteDC(mem);
+        EndPaint(hwnd, &ps);
+        return 0;
     }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* di = (DRAWITEMSTRUCT*)lp;
+        if (di->CtlType == ODT_BUTTON){ drawButton(di, s); return TRUE; }
+        break;
+    }
+    case WM_CTLCOLORSTATIC:
     case WM_CTLCOLORBTN: {
         HDC dc = (HDC)wp;
-        SetBkMode(dc, OPAQUE); SetTextColor(dc, CLR_TEXT); SetBkColor(dc, CLR_BG);
-        return (LRESULT)g_bgBrush;
+        SetBkMode(dc, OPAQUE); SetTextColor(dc, CLR_TEXT); SetBkColor(dc, CLR_CARD);
+        return (LRESULT)g_cardBrush;   // controls sit on white cards
     }
     case WM_CANVAS_CHANGED:
         if (s){
@@ -682,10 +807,12 @@ ConfigResult RunConfigDialog(MirrorConfig& cfg,
                            DEFAULT_PITCH|FF_DONTCARE, L"Segoe UI");
     };
     if (!g_font)      g_font      = mkFont(15, FW_NORMAL);
+    if (!g_subFont)   g_subFont   = mkFont(13, FW_NORMAL);
     if (!g_hdrFont)   g_hdrFont   = mkFont(17, FW_SEMIBOLD);
-    if (!g_titleFont) g_titleFont = mkFont(23, FW_SEMIBOLD);
-    if (!g_bgBrush)     g_bgBrush     = CreateSolidBrush(CLR_BG);
-    if (!g_bannerBrush) g_bannerBrush = CreateSolidBrush(CLR_BANNER_BG);
+    if (!g_btnFont)   g_btnFont   = mkFont(15, FW_SEMIBOLD);
+    if (!g_titleFont) g_titleFont = mkFont(22, FW_SEMIBOLD);
+    if (!g_bgBrush)   g_bgBrush   = CreateSolidBrush(CLR_BG);
+    if (!g_cardBrush) g_cardBrush = CreateSolidBrush(CLR_CARD);
 
     static bool canvasReg = false;
     if (!canvasReg){
@@ -712,7 +839,12 @@ ConfigResult RunConfigDialog(MirrorConfig& cfg,
     DlgState st;
     st.mons = &mons; st.out = &cfg; st.defaultPath = defaultPath;
 
-    int W = 940, H = 524;
+    // client must fit: header + banner + cards + options + buttons + margin
+    int clientW = LO_CARD_BX + LO_CARD_W + LO_MARGIN;
+    int clientH = LO_BTN_Y + 40 + LO_MARGIN;
+    RECT wr = { 0, 0, clientW, clientH };
+    AdjustWindowRectEx(&wr, WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU, FALSE, WS_EX_APPWINDOW);
+    int W = wr.right - wr.left, H = wr.bottom - wr.top;
     int sx = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
     int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 2;
     HWND hwnd = CreateWindowExW(WS_EX_APPWINDOW, L"MirrorCfgDialog", L"Mirror - Setup",
