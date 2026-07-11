@@ -421,26 +421,34 @@ void Mirror::updateCursor(IDXGIOutputDuplication* d, const DXGI_OUTDUPL_FRAME_IN
 }
 
 void Mirror::renderFrame() {
+    // Pull the newest frame *if* the source changed. Desktop Duplication only
+    // produces a frame when the captured monitor's content (or its cursor)
+    // moves, so we use a 0 ms timeout and never block here - pacing is handled
+    // by the FPS cap + frame-latency waitable in the main loop. When nothing
+    // changed we skip the copy but STILL present the last frame below, so the
+    // mirror keeps a steady output rate instead of only refreshing when a new
+    // source frame happens to arrive.
     ComPtr<IDXGIResource> res;
     DXGI_OUTDUPL_FRAME_INFO fi = {};
-    HRESULT hr = dupl->AcquireNextFrame(15, &fi, res.GetAddressOf());
-    if (hr == DXGI_ERROR_WAIT_TIMEOUT) return;
+    HRESULT hr = dupl->AcquireNextFrame(0, &fi, res.GetAddressOf());
     if (hr == DXGI_ERROR_ACCESS_LOST) {
         if (!createDuplication()) { g_reconfigure = true; }   // monitor likely gone
         return;
     }
-    if (FAILED(hr)) return;
-
-    ComPtr<ID3D11Texture2D> frameTex; res.As(&frameTex);
-    // clamp crop box to the actual frame in case the resolution changed under us
-    D3D11_TEXTURE2D_DESC fd = {}; if (frameTex) frameTex->GetDesc(&fd);
-    if (frameTex && (int)fd.Width >= cropX + cropW && (int)fd.Height >= cropY + cropH) {
-        D3D11_BOX box = { (UINT)cropX, (UINT)cropY, 0, (UINT)(cropX+cropW), (UINT)(cropY+cropH), 1 };
-        ctx->CopySubresourceRegion(cropTex.Get(), 0, 0, 0, 0, frameTex.Get(), 0, &box);
+    if (SUCCEEDED(hr)) {
+        ComPtr<ID3D11Texture2D> frameTex; res.As(&frameTex);
+        // clamp crop box to the actual frame in case the resolution changed under us
+        D3D11_TEXTURE2D_DESC fd = {}; if (frameTex) frameTex->GetDesc(&fd);
+        if (frameTex && (int)fd.Width >= cropX + cropW && (int)fd.Height >= cropY + cropH) {
+            D3D11_BOX box = { (UINT)cropX, (UINT)cropY, 0, (UINT)(cropX+cropW), (UINT)(cropY+cropH), 1 };
+            ctx->CopySubresourceRegion(cropTex.Get(), 0, 0, 0, 0, frameTex.Get(), 0, &box);
+        }
+        if (showCursor) updateCursor(dupl.Get(), fi);
+        dupl->ReleaseFrame();
+    } else if (hr != DXGI_ERROR_WAIT_TIMEOUT) {
+        return;   // a genuine capture error - skip this iteration
     }
-
-    if (showCursor) updateCursor(dupl.Get(), fi);
-    dupl->ReleaseFrame();
+    // (WAIT_TIMEOUT falls through: no new source frame, but we re-present.)
 
     // ---- render ----
     float black[4] = {0,0,0,1};
